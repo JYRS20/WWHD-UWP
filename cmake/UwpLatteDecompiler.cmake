@@ -1,0 +1,40 @@
+# Build the existing MPL-2.0 Cemu Latte decompiler without a Vulkan device/loader.
+set(WWHD_CEMU_DIR "${WWHD_ROOT}/runtime/third_party/cemu")
+file(GLOB_RECURSE WWHD_LATTE_SOURCES CONFIGURE_DEPENDS "${WWHD_CEMU_DIR}/*.cpp")
+list(FILTER WWHD_LATTE_SOURCES EXCLUDE REGEX "LatteDecompilerEmitMSL[^/]*\\.cpp$")
+add_library(wwhd_latte_glsl STATIC ${WWHD_LATTE_SOURCES} "${WWHD_ROOT}/runtime/src/gfx/d3d12/latte_decompiler.cpp")
+target_compile_features(wwhd_latte_glsl PUBLIC cxx_std_20)
+target_include_directories(wwhd_latte_glsl PUBLIC "${WWHD_CEMU_DIR}" "${WWHD_CEMU_DIR}/Cafe"
+ "${WWHD_ROOT}/runtime/third_party/fmt/include")
+target_compile_definitions(wwhd_latte_glsl PUBLIC ENABLE_VULKAN=1)
+target_compile_options(wwhd_latte_glsl PRIVATE "/FI${WWHD_CEMU_DIR}/cemu_shim.h")
+
+# Keep the address library shim out of consumers that include D3D12 SDK headers.
+add_library(wwhd_d3d12_texture_layout STATIC "${WWHD_ROOT}/runtime/src/gfx/d3d12/texture_layout.cpp")
+target_compile_features(wwhd_d3d12_texture_layout PUBLIC cxx_std_20)
+target_include_directories(wwhd_d3d12_texture_layout PUBLIC "${WWHD_ROOT}/runtime/src")
+target_compile_options(wwhd_d3d12_texture_layout PRIVATE "/FI${WWHD_CEMU_DIR}/cemu_shim.h")
+target_link_libraries(wwhd_d3d12_texture_layout PRIVATE wwhd_latte_glsl)
+
+add_library(wwhd_d3d12_viewport_state STATIC "${WWHD_ROOT}/runtime/src/gfx/d3d12/viewport_state.cpp")
+target_compile_features(wwhd_d3d12_viewport_state PUBLIC cxx_std_20)
+target_include_directories(wwhd_d3d12_viewport_state PUBLIC "${WWHD_ROOT}/runtime/src")
+target_compile_options(wwhd_d3d12_viewport_state PRIVATE "/FI${WWHD_CEMU_DIR}/cemu_shim.h")
+target_link_libraries(wwhd_d3d12_viewport_state PRIVATE wwhd_latte_glsl)
+target_link_libraries(wwhd_d3d12_draw_commands PUBLIC wwhd_d3d12_viewport_state)
+
+add_library(wwhd_d3d12_output_state STATIC "${WWHD_ROOT}/runtime/src/gfx/d3d12/output_merger_state.cpp")
+target_compile_features(wwhd_d3d12_output_state PUBLIC cxx_std_20)
+target_include_directories(wwhd_d3d12_output_state PUBLIC "${WWHD_ROOT}/runtime/src")
+target_compile_options(wwhd_d3d12_output_state PRIVATE "/FI${WWHD_CEMU_DIR}/cemu_shim.h")
+target_link_libraries(wwhd_d3d12_output_state PRIVATE wwhd_latte_glsl)
+target_sources(wwhd_d3d12_draw_commands PRIVATE "${WWHD_ROOT}/runtime/src/gfx/d3d12/output_merger_commands.cpp")
+target_link_libraries(wwhd_d3d12_draw_commands PUBLIC wwhd_d3d12_output_state)
+
+add_library(wwhd_d3d12_rasterizer_state STATIC "${WWHD_ROOT}/runtime/src/gfx/d3d12/rasterizer_state.cpp")
+target_compile_features(wwhd_d3d12_rasterizer_state PUBLIC cxx_std_20)
+target_include_directories(wwhd_d3d12_rasterizer_state PUBLIC "${WWHD_ROOT}/runtime/src")
+target_compile_options(wwhd_d3d12_rasterizer_state PRIVATE "/FI${WWHD_CEMU_DIR}/cemu_shim.h")
+target_link_libraries(wwhd_d3d12_rasterizer_state PRIVATE wwhd_latte_glsl)
+target_sources(wwhd_d3d12_draw_commands PRIVATE "${WWHD_ROOT}/runtime/src/gfx/d3d12/rasterizer_commands.cpp")
+target_link_libraries(wwhd_d3d12_draw_commands PUBLIC wwhd_d3d12_rasterizer_state)

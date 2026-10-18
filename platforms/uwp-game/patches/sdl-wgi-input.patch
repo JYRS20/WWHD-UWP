@@ -1,0 +1,61 @@
+--- a/src/joystick/windows/SDL_windows_gaming_input.c
++++ b/src/joystick/windows/SDL_windows_gaming_input.c
+@@ -763,8 +763,9 @@
+     if (hwdata->gamepad) {
+         /* IRawGameController exposes device-specific button and axis orders.
+          * Xbox retail controllers also implement IGamepad, whose reading is
+-         * stable and maps directly to SDL's standard gamepad layout. */
+-        joystick->nbuttons = SDL_GAMEPAD_BUTTON_COUNT;
++         * stable. Emit SDL's WGI raw layout, not SDL_GamepadButton enum indices:
++         * SDL_CreateMappingForWGIGamepad applies the raw mapping afterwards. */
++        joystick->nbuttons = 14; // WGI raw layout consumed by SDL_CreateMappingForWGIGamepad
+         joystick->naxes = SDL_GAMEPAD_AXIS_COUNT;
+         joystick->nhats = 0;
+         SDL_Log("WGI: using standardized IGamepad input path");
+@@ -875,35 +876,36 @@
+         if (SUCCEEDED(hr) &&
+             (!reading.Timestamp || reading.Timestamp != hwdata->timestamp)) {
+             static const enum __x_ABI_CWindows_CGaming_CInput_CGamepadButtons
+-                button_map[SDL_GAMEPAD_BUTTON_COUNT] = {
++                button_map[14] = {
+                     GamepadButtons_A,
+                     GamepadButtons_B,
+                     GamepadButtons_X,
+                     GamepadButtons_Y,
++                    GamepadButtons_LeftShoulder,
++                    GamepadButtons_RightShoulder,
+                     GamepadButtons_View,
+-                    GamepadButtons_None,
+                     GamepadButtons_Menu,
+                     GamepadButtons_LeftThumbstick,
+                     GamepadButtons_RightThumbstick,
+-                    GamepadButtons_LeftShoulder,
+-                    GamepadButtons_RightShoulder,
+                     GamepadButtons_DPadUp,
++                    GamepadButtons_DPadRight,
+                     GamepadButtons_DPadDown,
+                     GamepadButtons_DPadLeft,
+-                    GamepadButtons_DPadRight,
+                 };
+             const Sint16 axis[SDL_GAMEPAD_AXIS_COUNT] = {
++                // Keep SDL's WGI raw mapping: leftx:a1,lefty:a0~,rightx:a3,righty:a2~.
++                (Sint16)(reading.LeftThumbstickY * 32767.0),
+                 (Sint16)(reading.LeftThumbstickX * 32767.0),
+-                (Sint16)(-reading.LeftThumbstickY * 32767.0),
++                (Sint16)(reading.RightThumbstickY * 32767.0),
+                 (Sint16)(reading.RightThumbstickX * 32767.0),
+-                (Sint16)(-reading.RightThumbstickY * 32767.0),
+-                (Sint16)(reading.LeftTrigger * 32767.0),
+-                (Sint16)(reading.RightTrigger * 32767.0),
++                // SDL maps a full signed raw axis to a trigger: rest must be -32768.
++                (Sint16)(reading.LeftTrigger * 65535.0 - 32768.0),
++                (Sint16)(reading.RightTrigger * 65535.0 - 32768.0),
+             };
+             Uint64 event_timestamp = SDL_GetTicksNS();
+ 
+             hwdata->timestamp = reading.Timestamp;
+-            for (int i = 0; i < SDL_GAMEPAD_BUTTON_COUNT; ++i) {
++            for (int i = 0; i < 14; ++i) {
+                 SDL_SendJoystickButton(
+                     event_timestamp, joystick, (Uint8)i,
+                     button_map[i] != GamepadButtons_None &&
