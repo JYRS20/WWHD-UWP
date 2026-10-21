@@ -1,0 +1,526 @@
+--- a/clang/CMakeLists.txt
++++ b/clang/CMakeLists.txt
+@@ -498,7 +498,9 @@
+ add_subdirectory(runtime)
+
+ option(CLANG_BUILD_EXAMPLES "Build CLANG example programs by default." OFF)
+-add_subdirectory(examples)
++if(CLANG_BUILD_EXAMPLES)
++  add_subdirectory(examples)
++endif()
+
+ if(APPLE)
+   # this line is needed as a cleanup to ensure that any CMakeCaches with the old
+--- a/clang/lib/Driver/ToolChains/MSVC.cpp
++++ b/clang/lib/Driver/ToolChains/MSVC.cpp
+@@ -602,7 +602,7 @@
+
+ static VersionTuple getMSVCVersionFromExe(const std::string &BinDir) {
+   VersionTuple Version;
+-#ifdef _WIN32
++#if defined(_WIN32) && WINAPI_FAMILY != WINAPI_FAMILY_APP
+   SmallString<128> ClExe(BinDir);
+   llvm::sys::path::append(ClExe, "cl.exe");
+
+--- a/llvm/include/llvm/Support/Windows/WindowsSupport.h
++++ b/llvm/include/llvm/Support/Windows/WindowsSupport.h
+@@ -24,8 +24,14 @@
+ // mingw-w64 tends to define it as 0x0502 in its headers.
+ #undef _WIN32_WINNT
+
+-// Require at least Windows 7 API.
++#include <winapifamily.h>
++#if WINAPI_FAMILY == WINAPI_FAMILY_APP
++// UWP memory and packaged-library APIs require Windows 10 declarations.
++#define _WIN32_WINNT 0x0A00
++#else
++// Keep the original desktop minimum.
+ #define _WIN32_WINNT 0x0601
++#endif
+ #define WIN32_LEAN_AND_MEAN
+ #ifndef NOMINMAX
+ #define NOMINMAX
+--- a/llvm/lib/Support/RandomNumberGenerator.cpp
++++ b/llvm/lib/Support/RandomNumberGenerator.cpp
+@@ -23,6 +23,10 @@
+ #include "llvm/Support/raw_ostream.h"
+ #ifdef _WIN32
+ #include "llvm/Support/Windows/WindowsSupport.h"
++#if WINAPI_FAMILY == WINAPI_FAMILY_APP
++#include <bcrypt.h>
++#pragma comment(lib,"bcrypt.lib")
++#endif
+ #else
+ #include "Unix/Unix.h"
+ #endif
+@@ -69,6 +73,16 @@
+ // Get random vector of specified size
+ std::error_code llvm::getRandomBytes(void *Buffer, size_t Size) {
+ #ifdef _WIN32
++#if WINAPI_FAMILY == WINAPI_FAMILY_APP
++  auto *Out = static_cast<PUCHAR>(Buffer);
++  while (Size) {
++    ULONG Chunk = static_cast<ULONG>(std::min<size_t>(Size, 0xffffffffu));
++    NTSTATUS Status = BCryptGenRandom(nullptr, Out, Chunk, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
++    if (Status < 0) return std::make_error_code(std::errc::io_error);
++    Out += Chunk; Size -= Chunk;
++  }
++  return {};
++#else
+   HCRYPTPROV hProvider;
+   if (CryptAcquireContext(&hProvider, 0, 0, PROV_RSA_FULL,
+                            CRYPT_VERIFYCONTEXT | CRYPT_SILENT)) {
+@@ -77,6 +91,7 @@
+       return std::error_code();
+   }
+   return std::error_code(GetLastError(), std::system_category());
++#endif
+ #else
+   int Fd = open("/dev/urandom", O_RDONLY);
+   if (Fd != -1) {
+--- a/llvm/lib/Support/raw_socket_stream.cpp
++++ b/llvm/lib/Support/raw_socket_stream.cpp
+@@ -109,6 +109,12 @@
+
+ Expected<ListeningSocket> ListeningSocket::createUnix(StringRef SocketPath,
+                                                       int MaxBacklog) {
++#if defined(_WIN32) && WINAPI_FAMILY == WINAPI_FAMILY_APP
++  (void)SocketPath; (void)MaxBacklog;
++  return llvm::make_error<StringError>(std::make_error_code(std::errc::operation_not_supported),
++                                      "Local compiler server sockets are unavailable in UWP");
++#else
++
+
+   // Handle instances where the target socket address already exists and
+   // differentiate between a preexisting file with and without a bound socket
+@@ -175,6 +181,7 @@
+ #else
+   return ListeningSocket{Socket, SocketPath, PipeFD};
+ #endif // _WIN32
++#endif
+ }
+
+ // If a file descriptor being monitored by ::poll is closed by another thread,
+--- a/llvm/lib/Support/Windows/DynamicLibrary.inc
++++ b/llvm/lib/Support/Windows/DynamicLibrary.inc
+@@ -44,7 +44,11 @@
+     return &DynamicLibrary::Invalid;
+   }
+
++#if WINAPI_FAMILY == WINAPI_FAMILY_APP
++  HMODULE Handle = LoadPackagedLibrary(FileUnicode.data(), 0);
++#else
+   HMODULE Handle = LoadLibraryW(FileUnicode.data());
++#endif
+   if (Handle == NULL) {
+     MakeErrMsg(Err, std::string(File) + ": Can't open");
+     return &DynamicLibrary::Invalid;
+@@ -66,6 +70,12 @@
+ }
+
+ static bool GetProcessModules(HANDLE H, DWORD &Bytes, HMODULE *Data = nullptr) {
++#if WINAPI_FAMILY == WINAPI_FAMILY_APP
++  (void)H; (void)Data; Bytes = 0;
++  // AppContainer cannot enumerate arbitrary process modules. Use explicit symbols.
++  return false;
++#else
++
+   // EnumProcessModules will fail on Windows 64 while some versions of
+   // MingW-32 don't have EnumProcessModulesEx.
+   if (
+@@ -81,6 +91,7 @@
+     return false;
+   }
+   return true;
++#endif
+ }
+
+ void *DynamicLibrary::HandleSet::DLSym(void *Handle, const char *Symbol) {
+--- a/llvm/lib/Support/Windows/Memory.inc
++++ b/llvm/lib/Support/Windows/Memory.inc
+@@ -61,6 +61,10 @@
+ // Also large pages need to be manually enabled on your OS. If all this is
+ // sucessfull, we return the minimal large memory page size.
+ static size_t enableProcessLargePages() {
++#if WINAPI_FAMILY == WINAPI_FAMILY_APP
++  return 0; // UWP does not adjust process privileges.
++#else
++
+   HANDLE Token = 0;
+   size_t LargePageMin = GetLargePageMinimum();
+   if (LargePageMin)
+@@ -86,6 +90,7 @@
+   if (E == ERROR_SUCCESS)
+     return LargePageMin;
+   return 0;
++#endif
+ }
+
+ namespace llvm {
+@@ -130,8 +135,11 @@
+   DWORD Protect = getWindowsProtectionFlags(Flags);
+
+   size_t AllocSize = NumBlocks * Granularity;
+-  void *PA = ::VirtualAlloc(reinterpret_cast<void *>(Start), AllocSize,
+-                            AllocType, Protect);
++#if WINAPI_FAMILY == WINAPI_FAMILY_APP
++  void *PA = ::VirtualAllocFromApp(reinterpret_cast<void *>(Start), AllocSize, AllocType, Protect);
++#else
++  void *PA = ::VirtualAlloc(reinterpret_cast<void *>(Start), AllocSize, AllocType, Protect);
++#endif
+   if (PA == NULL) {
+     if (NearBlock || HugePages) {
+       // Try again without the NearBlock hint and without large memory pages
+@@ -173,7 +181,11 @@
+   DWORD Protect = getWindowsProtectionFlags(Flags);
+
+   DWORD OldFlags;
++#if WINAPI_FAMILY == WINAPI_FAMILY_APP
++  if (!VirtualProtectFromApp(M.Address, M.AllocatedSize, Protect, &OldFlags))
++#else
+   if (!VirtualProtect(M.Address, M.AllocatedSize, Protect, &OldFlags))
++#endif
+     return mapWindowsError(::GetLastError());
+
+   if (Flags & MF_EXEC)
+--- a/llvm/lib/Support/Windows/Path.inc
++++ b/llvm/lib/Support/Windows/Path.inc
+@@ -41,6 +41,22 @@
+ #pragma comment(lib, "ole32.lib")    // This provides CoTaskMemFree
+ #endif
+
++#if WINAPI_FAMILY == WINAPI_FAMILY_APP
++static HANDLE LLVMUwpCreateFileW(LPCWSTR Path, DWORD Access, DWORD Share,
++    LPSECURITY_ATTRIBUTES Security, DWORD Creation, DWORD Flags, HANDLE Template) {
++  CREATEFILE2_EXTENDED_PARAMETERS P{};
++  P.dwSize = sizeof(P); P.dwFileAttributes = Flags & 0xffffu;
++  const DWORD Qos = SECURITY_SQOS_PRESENT | SECURITY_CONTEXT_TRACKING |
++                    SECURITY_EFFECTIVE_ONLY | SECURITY_DELEGATION;
++  P.dwSecurityQosFlags = Flags & Qos; P.dwFileFlags = Flags & ~(0xffffu | Qos);
++  P.lpSecurityAttributes = Security; P.hTemplateFile = Template;
++  return CreateFile2FromAppW(Path, Access, Share, Creation, &P);
++}
++#define LLVM_UWP_CREATE_FILE_W LLVMUwpCreateFileW
++#else
++#define LLVM_UWP_CREATE_FILE_W CreateFileW
++#endif
++
+ using namespace llvm;
+
+ using llvm::sys::windows::CurCPToUTF16;
+@@ -289,7 +305,7 @@
+   // file to be deleted once it is closed. We also use the flags
+   // FILE_FLAG_BACKUP_SEMANTICS (which allows us to open directories), and
+   // FILE_FLAG_OPEN_REPARSE_POINT (don't follow symlinks).
+-  ScopedFileHandle h(::CreateFileW(
++  ScopedFileHandle h(::LLVM_UWP_CREATE_FILE_W(
+       c_str(path_utf16), DELETE,
+       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+       OPEN_EXISTING,
+@@ -517,7 +533,7 @@
+     // to arrange for the destination file to be deleted when the other process
+     // closes it.
+     ScopedFileHandle ToHandle(
+-        ::CreateFileW(WideTo.begin(), GENERIC_READ | DELETE,
++        ::LLVM_UWP_CREATE_FILE_W(WideTo.begin(), GENERIC_READ | DELETE,
+                       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                       NULL, OPEN_EXISTING,
+                       FILE_ATTRIBUTE_NORMAL | FILE_FLAG_DELETE_ON_CLOSE, NULL));
+@@ -544,7 +560,7 @@
+           // before we could move it. Check whether this is the case, as it
+           // might have caused the permission denied error. If that was the
+           // case, we don't need to move it ourselves.
+-          ScopedFileHandle ToHandle2(::CreateFileW(
++          ScopedFileHandle ToHandle2(::LLVM_UWP_CREATE_FILE_W(
+               WideTo.begin(), 0,
+               FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+               OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL));
+@@ -590,7 +606,7 @@
+     if (Retry != 0)
+       ::Sleep(10);
+     FromHandle =
+-        ::CreateFileW(WideFrom.begin(), GENERIC_READ | DELETE,
++        ::LLVM_UWP_CREATE_FILE_W(WideFrom.begin(), GENERIC_READ | DELETE,
+                       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                       NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+     if (FromHandle)
+@@ -795,7 +811,7 @@
+   }
+
+   ScopedFileHandle h(
+-      ::CreateFileW(path_utf16.begin(), 0, // Attributes only.
++      ::LLVM_UWP_CREATE_FILE_W(path_utf16.begin(), 0, // Attributes only.
+                     FILE_SHARE_DELETE | FILE_SHARE_READ | FILE_SHARE_WRITE,
+                     NULL, OPEN_EXISTING, Flags, 0));
+   if (!h)
+@@ -1193,7 +1209,7 @@
+   SA.bInheritHandle = Inherit;
+
+   HANDLE H =
+-      ::CreateFileW(PathUTF16.begin(), Access,
++      ::LLVM_UWP_CREATE_FILE_W(PathUTF16.begin(), Access,
+                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, &SA,
+                     Disp, Flags, NULL);
+   if (H == INVALID_HANDLE_VALUE) {
+@@ -1373,6 +1389,11 @@
+ }
+
+ std::error_code remove_directories(const Twine &path, bool IgnoreErrors) {
++#if WINAPI_FAMILY == WINAPI_FAMILY_APP
++  (void)path; (void)IgnoreErrors;
++  return std::make_error_code(std::errc::operation_not_supported);
++#else
++
+   SmallString<128> NativePath;
+   llvm::sys::path::native(path, NativePath, path::Style::windows_backslash);
+   // Convert to utf-16.
+@@ -1420,6 +1441,7 @@
+   if (FAILED(HR) && !IgnoreErrors)
+     return mapWindowsError(HRESULT_CODE(HR));
+   return std::error_code();
++#endif
+ }
+
+ static void expandTildeExpr(SmallVectorImpl<char> &Path) {
+@@ -1486,6 +1508,12 @@
+ } // end namespace fs
+
+ namespace path {
++#if WINAPI_FAMILY == WINAPI_FAMILY_APP
++// The embedded compiler gets all roots explicitly through its in-memory VFS.
++bool home_directory(SmallVectorImpl<char> &result) { result.clear(); return false; }
++bool user_config_directory(SmallVectorImpl<char> &result) { result.clear(); return false; }
++bool cache_directory(SmallVectorImpl<char> &result) { result.clear(); return false; }
++#else
+ static bool getKnownFolderPath(KNOWNFOLDERID folderId,
+                                SmallVectorImpl<char> &result) {
+   wchar_t *path = nullptr;
+@@ -1512,6 +1540,8 @@
+ bool cache_directory(SmallVectorImpl<char> &result) {
+   return getKnownFolderPath(FOLDERID_LocalAppData, result);
+ }
++
++#endif
+
+ static bool getTempDirEnvVar(const wchar_t *Var, SmallVectorImpl<char> &Res) {
+   SmallVector<wchar_t, 1024> Buf;
+--- a/llvm/lib/Support/Windows/Process.inc
++++ b/llvm/lib/Support/Windows/Process.inc
+@@ -1,3 +1,4 @@
++#include "llvm/Support/RandomNumberGenerator.h"
+ //===- Win32/Process.cpp - Win32 Process Implementation ------- -*- C++ -*-===//
+ //
+ // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+@@ -69,6 +70,10 @@
+ }
+
+ size_t Process::GetMallocUsage() {
++#if WINAPI_FAMILY == WINAPI_FAMILY_APP
++  return 0; // Heap enumeration is unavailable in AppContainer.
++#else
++
+   _HEAPINFO hinfo;
+   hinfo._pentry = NULL;
+
+@@ -78,6 +83,7 @@
+     size += hinfo._size;
+
+   return size;
++#endif
+ }
+
+ void Process::GetTimeUsage(TimePoint<> &elapsed,
+@@ -109,8 +115,9 @@
+   //
+   // Windows also has modal pop-up message boxes.  As this method is used by
+   // bugpoint, preventing these pop-ups is additionally important.
+-  SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX |
+-               SEM_NOOPENFILEERRORBOX);
++#if WINAPI_FAMILY != WINAPI_FAMILY_APP
++  SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
++#endif
+
+   coreFilesPrevented = true;
+ }
+@@ -459,6 +466,12 @@
+ }
+
+ unsigned Process::GetRandomNumber() {
++#if WINAPI_FAMILY == WINAPI_FAMILY_APP
++  unsigned Value;
++  if (!llvm::getRandomBytes(&Value, sizeof(Value))) return Value;
++  return GetPseudoRandomNumber();
++#else
++
+   // Try to use CryptGenRandom.
+   HCRYPTPROV HCPC;
+   if (::CryptAcquireContextW(&HCPC, NULL, NULL, PROV_RSA_FULL,
+@@ -472,6 +485,7 @@
+
+   // If that fails, fall back to pseudo-random numbers.
+   return GetPseudoRandomNumber();
++#endif
+ }
+
+ typedef NTSTATUS(WINAPI *RtlGetVersionPtr)(PRTL_OSVERSIONINFOW);
+--- a/llvm/lib/Support/Windows/Program.inc
++++ b/llvm/lib/Support/Windows/Program.inc
+@@ -37,6 +37,10 @@
+
+ ErrorOr<std::string> sys::findProgramByName(StringRef Name,
+                                             ArrayRef<StringRef> Paths) {
++#if WINAPI_FAMILY == WINAPI_FAMILY_APP
++  (void)Name; (void)Paths; return std::make_error_code(std::errc::operation_not_supported);
++#else
++
+   assert(!Name.empty() && "Must have a name!");
+
+   if (Name.find_first_of("/\\") != StringRef::npos)
+@@ -106,6 +110,7 @@
+
+   llvm::sys::path::make_preferred(U8Result);
+   return std::string(U8Result.begin(), U8Result.end());
++#endif
+ }
+
+ bool MakeErrMsg(std::string *ErrMsg, const std::string &prefix) {
+@@ -129,6 +134,10 @@
+
+ static HANDLE RedirectIO(std::optional<StringRef> Path, int fd,
+                          std::string *ErrMsg) {
++#if WINAPI_FAMILY == WINAPI_FAMILY_APP
++  (void)Path; (void)fd; if(ErrMsg)*ErrMsg="Process redirection is unavailable in UWP"; return INVALID_HANDLE_VALUE;
++#else
++
+   HANDLE h;
+   if (!Path) {
+     if (!DuplicateHandle(GetCurrentProcess(), (HANDLE)_get_osfhandle(fd),
+@@ -167,6 +176,7 @@
+   }
+
+   return h;
++#endif
+ }
+
+ } // namespace llvm
+@@ -177,6 +187,10 @@
+                     ArrayRef<std::optional<StringRef>> Redirects,
+                     unsigned MemoryLimit, std::string *ErrMsg,
+                     BitVector *AffinityMask, bool DetachProcess) {
++#if WINAPI_FAMILY == WINAPI_FAMILY_APP
++  (void)PI; (void)Program; (void)Args; (void)Env; (void)Redirects; (void)MemoryLimit; (void)AffinityMask; (void)DetachProcess; if(ErrMsg)*ErrMsg="External processes are unavailable in UWP; use the embedded compiler"; return false;
++#else
++
+   if (!sys::fs::can_execute(Program)) {
+     if (ErrMsg)
+       *ErrMsg = "program not executable";
+@@ -348,6 +362,7 @@
+   }
+
+   return true;
++#endif
+ }
+
+ static bool argNeedsQuotes(StringRef Arg) {
+--- a/llvm/lib/Support/Signals.cpp
++++ b/llvm/lib/Support/Signals.cpp
+@@ -277,5 +277,10 @@
+ #include "Unix/Signals.inc"
+ #endif
+ #ifdef _WIN32
++#include <winapifamily.h>
++#if WINAPI_FAMILY == WINAPI_FAMILY_APP
++#include "UWP/Signals.inc"
++#else
+ #include "Windows/Signals.inc"
+ #endif
++#endif
+--- a/llvm/lib/Support/Windows/Threading.inc
++++ b/llvm/lib/Support/Windows/Threading.inc
+@@ -161,6 +161,12 @@
+ }
+
+ static std::optional<std::vector<USHORT>> getActiveGroups() {
++#if WINAPI_FAMILY == WINAPI_FAMILY_APP
++  GROUP_AFFINITY Affinity{};
++  if (!GetThreadGroupAffinity(GetCurrentThread(), &Affinity)) return std::nullopt;
++  return std::vector<USHORT>{Affinity.Group};
++#else
++
+   USHORT Count = 0;
+   if (::GetProcessGroupAffinity(GetCurrentProcess(), &Count, nullptr))
+     return std::nullopt;
+@@ -174,6 +180,7 @@
+     return std::nullopt;
+
+   return Groups;
++#endif
+ }
+
+ static ArrayRef<ProcessorGroup> getProcessorGroups() {
+--- a/llvm/lib/Support/ErrorHandling.cpp
++++ b/llvm/lib/Support/ErrorHandling.cpp
+@@ -265,12 +265,14 @@
+   // The mapping of NTSTATUS to Win32 error loses some information; special
+   // case the generic ERROR_ACCESS_DENIED code to check the underlying
+   // NTSTATUS and potentially return a more accurate error code.
++#if WINAPI_FAMILY != WINAPI_FAMILY_APP
+   if (EV == ERROR_ACCESS_DENIED) {
+     llvm::errc code = RtlGetLastNtStatus() == STATUS_DELETE_PENDING
+                           ? errc::delete_pending
+                           : errc::permission_denied;
+     return make_error_code(code);
+   }
++#endif
+   return mapWindowsError(EV);
+ }
+
+--- a/llvm/lib/WindowsDriver/MSVCPaths.cpp
++++ b/llvm/lib/WindowsDriver/MSVCPaths.cpp
+@@ -35,8 +35,8 @@
+ #include <windows.h>
+ #endif
+
+-#ifdef _MSC_VER
+-// Don't support SetupApi on MinGW.
++#if defined(_MSC_VER) && WINAPI_FAMILY != WINAPI_FAMILY_APP
++// SetupApi/COM discovery is desktop-only; embedded UWP uses explicit inputs.
+ #define USE_MSVC_SETUP_API
+
+ // Make sure this comes before MSVCSetupApi.h
+@@ -174,7 +174,7 @@
+ /// characters are compared.  This function only searches HKLM.
+ static bool getSystemRegistryString(const char *keyPath, const char *valueName,
+                                     std::string &value, std::string *phValue) {
+-#ifndef _WIN32
++#if !defined(_WIN32) || WINAPI_FAMILY == WINAPI_FAMILY_APP
+   return false;
+ #else
+   HKEY hRootKey = HKEY_LOCAL_MACHINE;
+--- /dev/null
++++ b/llvm/lib/Support/UWP/Signals.inc
+@@ -0,0 +1,24 @@
++// UWP embedded compiler: OS crash handling belongs to the host application.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++#include <atomic>
++#include <cstdlib>
++static bool findModulesAndOffsets(void**,int,const char**,intptr_t*,const char*,StringSaver&){return false;}
++static bool printMarkupContext(raw_ostream&,const char*){return false;}
++static std::atomic<void(*)()> UwpPipeHandler{nullptr};
++bool llvm::sys::RemoveFileOnSignal(StringRef,std::string* Error) {
++  if(Error)*Error="Automatic signal cleanup is unavailable in the UWP compiler";
++  return true;
++}
++void llvm::sys::DontRemoveFileOnSignal(StringRef){}
++void llvm::sys::PrintStackTraceOnErrorSignal(StringRef,bool){}
++void llvm::sys::DisableSystemDialogsOnCrash(){}
++void llvm::sys::PrintStackTrace(raw_ostream& Out,int){Out<<"Native compiler backtraces unavailable in UWP; use host diagnostics.\n";}
++void llvm::sys::SetInterruptFunction(void(*)()){}
++void llvm::sys::SetInfoSignalFunction(void(*)()){}
++void llvm::sys::SetOneShotPipeSignalFunction(void(*Handler)()){UwpPipeHandler=Handler;}
++void llvm::sys::DefaultOneShotPipeSignalHandler(){std::abort();}
++void llvm::sys::CallOneShotPipeSignalHandler(){if(auto Handler=UwpPipeHandler.exchange(nullptr))Handler();}
++void llvm::sys::AddSignalHandler(SignalHandlerCallback Handler,void* Cookie){insertSignalHandler(Handler,Cookie);}
++void llvm::sys::RunInterruptHandlers(){llvm::sys::RunSignalHandlers();}
++void llvm::sys::CleanupOnSignal(uintptr_t){llvm::sys::RunSignalHandlers();}
++void llvm::sys::unregisterHandlers(){}

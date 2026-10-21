@@ -75,7 +75,7 @@ int describe(char* buf, size_t cap, uintptr_t addr, char* path, size_t path_cap)
     HMODULE m = nullptr;
     if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                             (LPCWSTR)addr, &m) || !m)
-        return 0;
+        return game_function(buf,cap,addr);
     wchar_t wide[1024];
     DWORD wn = GetModuleFileNameW(m, wide, 1024);
     char full[1024];

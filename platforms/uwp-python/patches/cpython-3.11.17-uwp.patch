@@ -1,0 +1,601 @@
+--- a/PC/pyconfig.h
++++ b/PC/pyconfig.h
+@@ -483,7 +483,9 @@
+ /* #define HAVE_CLOCK */
+
+ /* Define when any dynamic module loading is enabled */
++#ifndef WWHD_UWP
+ #define HAVE_DYNAMIC_LOADING
++#endif
+
+ /* Define if you have ftime.  */
+ #define HAVE_FTIME
+--- a/Modules/_randommodule.c
++++ b/Modules/_randommodule.c
+@@ -71,6 +71,9 @@
+ #endif
+
+ #include "Python.h"
++#ifdef WWHD_UWP
++#include <windows.h>
++#endif
+ #include "pycore_moduleobject.h"  // _PyModule_GetState()
+ #ifdef HAVE_PROCESS_H
+ #  include <process.h>            // getpid()
+@@ -259,7 +262,11 @@
+     key[1] = (uint32_t)(now >> 32);
+
+ #ifdef HAVE_GETPID
++    #ifdef WWHD_UWP
++    key[2] = (uint32_t)GetCurrentProcessId();
++#else
+     key[2] = (uint32_t)getpid();
++#endif
+ #else
+     key[2] = 0;
+ #endif
+--- a/Modules/_io/_iomodule.c
++++ b/Modules/_io/_iomodule.c
+@@ -20,7 +20,7 @@
+ #include <sys/stat.h>
+ #endif /* HAVE_SYS_STAT_H */
+
+-#ifdef MS_WINDOWS
++#if defined(MS_WINDOWS) && !defined(WWHD_UWP)
+ #include <windows.h>
+ #endif
+
+@@ -318,7 +318,7 @@
+     /* Create the Raw file stream */
+     {
+         PyObject *RawIO_class = (PyObject *)&PyFileIO_Type;
+-#ifdef MS_WINDOWS
++#if defined(MS_WINDOWS) && !defined(WWHD_UWP)
+         const PyConfig *config = _Py_GetConfig();
+         if (!config->legacy_windows_stdio && _PyIO_get_console_type(path_or_fd) != '\0') {
+             RawIO_class = (PyObject *)&PyWindowsConsoleIO_Type;
+@@ -657,7 +657,7 @@
+     // PyRawIOBase_Type(PyIOBase_Type) subclasses
+     &PyFileIO_Type,
+     &_PyBytesIOBuffer_Type,
+-#ifdef MS_WINDOWS
++#if defined(MS_WINDOWS) && !defined(WWHD_UWP)
+     &PyWindowsConsoleIO_Type,
+ #endif
+
+@@ -712,7 +712,7 @@
+     PyFileIO_Type.tp_base = &PyRawIOBase_Type;
+     PyBytesIO_Type.tp_base = &PyBufferedIOBase_Type;
+     PyStringIO_Type.tp_base = &PyTextIOBase_Type;
+-#ifdef MS_WINDOWS
++#if defined(MS_WINDOWS) && !defined(WWHD_UWP)
+     PyWindowsConsoleIO_Type.tp_base = &PyRawIOBase_Type;
+ #endif
+     PyBufferedReader_Type.tp_base = &PyBufferedIOBase_Type;
+--- a/Modules/_io/fileio.c
++++ b/Modules/_io/fileio.c
+@@ -2,6 +2,7 @@
+
+ #define PY_SSIZE_T_CLEAN
+ #include "Python.h"
++#include "uwp_winfile.h"
+ #include "pycore_fileutils.h"     // _Py_BEGIN_SUPPRESS_IPH
+ #include "pycore_object.h"        // _PyObject_GC_UNTRACK()
+ #include "structmember.h"         // PyMemberDef
+--- a/Modules/posixmodule.c
++++ b/Modules/posixmodule.c
+@@ -10,6 +10,7 @@
+ #define PY_SSIZE_T_CLEAN
+
+ #include "Python.h"
++#include "uwp_winfile.h"
+ // Include <windows.h> before pycore internal headers. FSCTL_GET_REPARSE_POINT
+ // is not exported by <windows.h> if the WIN32_LEAN_AND_MEAN macro is defined,
+ // whereas pycore_condvar.h defines the WIN32_LEAN_AND_MEAN macro.
+@@ -5897,6 +5898,11 @@
+ os_execv_impl(PyObject *module, path_t *path, PyObject *argv)
+ /*[clinic end generated code: output=3b52fec34cd0dafd input=9bac31efae07dac7]*/
+ {
++#ifdef WWHD_UWP
++    PyErr_SetString(PyExc_NotImplementedError,"Process/user/handle service is unavailable in UWP");
++    return NULL;
++#else
++
+     EXECV_CHAR **argvlist;
+     Py_ssize_t argc;
+
+@@ -5943,6 +5949,8 @@
+     posix_error();
+     free_string_array(argvlist, argc);
+     return NULL;
++
++#endif
+ }
+
+
+@@ -5963,6 +5971,11 @@
+ os_execve_impl(PyObject *module, path_t *path, PyObject *argv, PyObject *env)
+ /*[clinic end generated code: output=ff9fa8e4da8bde58 input=626804fa092606d9]*/
+ {
++#ifdef WWHD_UWP
++    PyErr_SetString(PyExc_NotImplementedError,"Process/user/handle service is unavailable in UWP");
++    return NULL;
++#else
++
+     EXECV_CHAR **argvlist = NULL;
+     EXECV_CHAR **envlist;
+     Py_ssize_t argc, envc;
+@@ -6028,6 +6041,8 @@
+     if (argvlist)
+         free_string_array(argvlist, argc);
+     return NULL;
++
++#endif
+ }
+
+ #endif /* HAVE_EXECV */
+@@ -6567,6 +6582,11 @@
+ os_spawnv_impl(PyObject *module, int mode, path_t *path, PyObject *argv)
+ /*[clinic end generated code: output=71cd037a9d96b816 input=43224242303291be]*/
+ {
++#ifdef WWHD_UWP
++    PyErr_SetString(PyExc_NotImplementedError,"Process/user/handle service is unavailable in UWP");
++    return NULL;
++#else
++
+     EXECV_CHAR **argvlist;
+     int i;
+     Py_ssize_t argc;
+@@ -6650,6 +6670,8 @@
+         return NULL;
+     }
+     return Py_BuildValue(_Py_PARSE_INTPTR, spawnval);
++
++#endif
+ }
+
+ /*[clinic input]
+@@ -6673,6 +6695,11 @@
+                 PyObject *env)
+ /*[clinic end generated code: output=30fe85be56fe37ad input=3e40803ee7c4c586]*/
+ {
++#ifdef WWHD_UWP
++    PyErr_SetString(PyExc_NotImplementedError,"Process/user/handle service is unavailable in UWP");
++    return NULL;
++#else
++
+     EXECV_CHAR **argvlist;
+     EXECV_CHAR **envlist;
+     PyObject *res = NULL;
+@@ -6772,6 +6799,8 @@
+     free_string_array(argvlist, lastarg);
+   fail_0:
+     return res;
++
++#endif
+ }
+
+ #endif /* HAVE_SPAWNV */
+@@ -7656,7 +7685,13 @@
+ os_getpid_impl(PyObject *module)
+ /*[clinic end generated code: output=9ea6fdac01ed2b3c input=5a9a00f0ab68aa00]*/
+ {
++#ifdef WWHD_UWP
++    return PyLong_FromUnsignedLong(GetCurrentProcessId());
++#else
++
+     return PyLong_FromPid(getpid());
++
++#endif
+ }
+ #endif /* HAVE_GETPID */
+
+@@ -7964,6 +7999,11 @@
+ static PyObject*
+ win32_getppid()
+ {
++#ifdef WWHD_UWP
++    PyErr_SetString(PyExc_NotImplementedError,"Process/user/handle service is unavailable in UWP");
++    return NULL;
++#else
++
+     HANDLE snapshot;
+     pid_t mypid;
+     PyObject* result = NULL;
+@@ -7997,6 +8037,8 @@
+     CloseHandle(snapshot);
+
+     return result;
++
++#endif
+ }
+ #endif /*MS_WINDOWS*/
+
+@@ -8034,6 +8076,11 @@
+ os_getlogin_impl(PyObject *module)
+ /*[clinic end generated code: output=a32e66a7e5715dac input=2a21ab1e917163df]*/
+ {
++#ifdef WWHD_UWP
++    PyErr_SetString(PyExc_NotImplementedError,"Process/user/handle service is unavailable in UWP");
++    return NULL;
++#else
++
+     PyObject *result = NULL;
+ #ifdef MS_WINDOWS
+     wchar_t user_name[UNLEN + 1];
+@@ -8062,6 +8109,8 @@
+     errno = old_errno;
+ #endif
+     return result;
++
++#endif
+ }
+ #endif /* HAVE_GETLOGIN */
+
+@@ -8629,6 +8678,11 @@
+ os_waitpid_impl(PyObject *module, pid_t pid, int options)
+ /*[clinic end generated code: output=5c37c06887a20270 input=0bf1666b8758fda3]*/
+ {
++#ifdef WWHD_UWP
++    PyErr_SetString(PyExc_NotImplementedError,"Process/user/handle service is unavailable in UWP");
++    return NULL;
++#else
++
+     pid_t res;
+     int async_err = 0;
+     WAIT_TYPE status;
+@@ -8643,6 +8697,8 @@
+         return (!async_err) ? posix_error() : NULL;
+
+     return Py_BuildValue("Ni", PyLong_FromPid(res), WAIT_STATUS_INT(status));
++
++#endif
+ }
+ #elif defined(HAVE_CWAIT)
+ /* MS C has a variant of waitpid() that's usable for most purposes. */
+@@ -8664,6 +8720,11 @@
+ os_waitpid_impl(PyObject *module, intptr_t pid, int options)
+ /*[clinic end generated code: output=be836b221271d538 input=40f2440c515410f8]*/
+ {
++#ifdef WWHD_UWP
++    PyErr_SetString(PyExc_NotImplementedError,"External process waiting is unavailable in UWP");
++    return NULL;
++#else
++
+     int status;
+     intptr_t res;
+     int async_err = 0;
+@@ -8682,6 +8743,8 @@
+
+     /* shift the status left a byte so this is more like the POSIX waitpid */
+     return Py_BuildValue(_Py_PARSE_INTPTR "K", res, ustatus << 8);
++
++#endif
+ }
+ #endif
+
+@@ -8977,6 +9040,11 @@
+                 int target_is_directory, int dir_fd)
+ /*[clinic end generated code: output=08ca9f3f3cf960f6 input=e820ec4472547bc3]*/
+ {
++#ifdef WWHD_UWP
++    PyErr_SetString(PyExc_NotImplementedError,"Symbolic links are unavailable in this embedded UWP runtime");
++    return NULL;
++#else
++
+ #ifdef MS_WINDOWS
+     DWORD result;
+     DWORD flags = 0;
+@@ -9074,6 +9142,8 @@
+ #endif
+
+     Py_RETURN_NONE;
++
++#endif
+ }
+ #endif /* HAVE_SYMLINK */
+
+@@ -13525,6 +13595,10 @@
+ os_cpu_count_impl(PyObject *module)
+ /*[clinic end generated code: output=5fc29463c3936a9c input=e7c8f4ba6dbbadd3]*/
+ {
++#ifdef WWHD_UWP
++    Py_RETURN_NONE; /* System processor enumeration is not available here. */
++#else
++
+     int ncpu = 0;
+ #ifdef MS_WINDOWS
+     ncpu = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+@@ -13550,6 +13624,8 @@
+         return PyLong_FromLong(ncpu);
+     else
+         Py_RETURN_NONE;
++
++#endif
+ }
+
+
+@@ -13611,6 +13687,11 @@
+ os_get_handle_inheritable_impl(PyObject *module, intptr_t handle)
+ /*[clinic end generated code: output=36be5afca6ea84d8 input=cfe99f9c05c70ad1]*/
+ {
++#ifdef WWHD_UWP
++    PyErr_SetString(PyExc_NotImplementedError,"Process/user/handle service is unavailable in UWP");
++    return -1;
++#else
++
+     DWORD flags;
+
+     if (!GetHandleInformation((HANDLE)handle, &flags)) {
+@@ -13619,6 +13700,8 @@
+     }
+
+     return flags & HANDLE_FLAG_INHERIT;
++
++#endif
+ }
+
+
+@@ -13636,12 +13719,19 @@
+                                int inheritable)
+ /*[clinic end generated code: output=021d74fe6c96baa3 input=7a7641390d8364fc]*/
+ {
++#ifdef WWHD_UWP
++    PyErr_SetString(PyExc_NotImplementedError,"Process/user/handle service is unavailable in UWP");
++    return NULL;
++#else
++
+     DWORD flags = inheritable ? HANDLE_FLAG_INHERIT : 0;
+     if (!SetHandleInformation((HANDLE)handle, HANDLE_FLAG_INHERIT, flags)) {
+         PyErr_SetFromWindowsErr(0);
+         return NULL;
+     }
+     Py_RETURN_NONE;
++
++#endif
+ }
+ #endif /* MS_WINDOWS */
+
+--- a/Python/fileutils.c
++++ b/Python/fileutils.c
+@@ -1,4 +1,5 @@
+ #include "Python.h"
++#include "uwp_winfile.h"
+ #include "pycore_fileutils.h"     // fileutils definitions
+ #include "pycore_runtime.h"       // _PyRuntime
+ #include "osdefs.h"               // SEP
+@@ -1283,6 +1284,12 @@
+ static int
+ get_inheritable(int fd, int raise)
+ {
++#ifdef WWHD_UWP
++    HANDLE handle=_Py_get_osfhandle_noraise(fd);
++    if(handle==INVALID_HANDLE_VALUE){if(raise)PyErr_SetFromErrno(PyExc_OSError);return -1;}
++    return 0; /* Embedded UWP file descriptors cannot be inherited by a child process. */
++#else
++
+ #ifdef MS_WINDOWS
+     HANDLE handle;
+     DWORD flags;
+@@ -1311,6 +1318,8 @@
+         return -1;
+     }
+     return !(flags & FD_CLOEXEC);
++#endif
++
+ #endif
+ }
+
+@@ -1328,6 +1337,13 @@
+ static int
+ set_inheritable(int fd, int inheritable, int raise, int *atomic_flag_works)
+ {
++#ifdef WWHD_UWP
++    if(inheritable){errno=ENOSYS;if(raise)PyErr_SetString(PyExc_NotImplementedError,"Inheritable handles are unavailable in UWP");return -1;}
++    if(_Py_get_osfhandle_noraise(fd)==INVALID_HANDLE_VALUE){if(raise)PyErr_SetFromErrno(PyExc_OSError);return -1;}
++    if(atomic_flag_works)*atomic_flag_works=1;
++    return 0;
++#else
++
+ #ifdef MS_WINDOWS
+     HANDLE handle;
+     DWORD flags;
+@@ -1456,6 +1472,8 @@
+         return -1;
+     }
+     return 0;
++#endif
++
+ #endif
+ }
+
+--- a/Python/sysmodule.c
++++ b/Python/sysmodule.c
+@@ -1502,6 +1502,7 @@
+     realMinor = ver.dwMinorVersion;
+     realBuild = ver.dwBuildNumber;
+
++#ifndef WWHD_UWP
+     // GetVersion will lie if we are running in a compatibility mode.
+     // We need to read the version info from a system file resource
+     // to accurately identify the OS version. If we fail for any reason,
+@@ -1523,6 +1524,7 @@
+         }
+         PyMem_RawFree(verblock);
+     }
++#endif
+     SET_VERSION_INFO(Py_BuildValue("(kkk)",
+         realMajor,
+         realMinor,
+@@ -1536,6 +1538,7 @@
+ error:
+     Py_DECREF(version);
+     return NULL;
++
+ }
+
+ #pragma warning(pop)
+--- a/Python/pytime.c
++++ b/Python/pytime.c
+@@ -868,7 +868,11 @@
+     FILETIME system_time;
+     ULARGE_INTEGER large;
+
++#ifdef WWHD_UWP
++    GetSystemTimePreciseAsFileTime(&system_time);
++#else
+     GetSystemTimeAsFileTime(&system_time);
++#endif
+     large.u.LowPart = system_time.dwLowDateTime;
+     large.u.HighPart = system_time.dwHighDateTime;
+     /* 11,644,473,600,000,000,000: number of nanoseconds between
+@@ -877,6 +881,10 @@
+     _PyTime_t ns = large.QuadPart * 100 - 11644473600000000000;
+     *tp = pytime_from_nanoseconds(ns);
+     if (info) {
++#ifdef WWHD_UWP
++        info->implementation="GetSystemTimePreciseAsFileTime()";
++        info->monotonic=0;info->adjustable=1;info->resolution=1e-7;
++#else
+         DWORD timeAdjustment, timeIncrement;
+         BOOL isTimeAdjustmentDisabled, ok;
+
+@@ -890,6 +898,7 @@
+         }
+         info->resolution = timeIncrement * 1e-7;
+         info->adjustable = 1;
++#endif
+     }
+
+ #else   /* MS_WINDOWS */
+@@ -1042,9 +1051,17 @@
+ #endif
+
+
++#ifdef WWHD_UWP
++static int py_get_win_perf_counter(_PyTime_t*,_Py_clock_info_t*,int);
++#endif
++
+ static int
+ py_get_monotonic_clock(_PyTime_t *tp, _Py_clock_info_t *info, int raise_exc)
+ {
++#ifdef WWHD_UWP
++    return py_get_win_perf_counter(tp,info,raise_exc);
++#else
++
+     assert(info == NULL || raise_exc);
+
+ #if defined(MS_WINDOWS)
+@@ -1164,6 +1181,8 @@
+     }
+ #endif
+     return 0;
++
++#endif
+ }
+
+
+--- a/Objects/object.c
++++ b/Objects/object.c
+@@ -1847,7 +1847,7 @@
+
+
+
+-#ifdef MS_WINDOWS
++#if defined(MS_WINDOWS) && !defined(WWHD_UWP)
+ extern PyTypeObject PyHKEY_Type;
+ #endif
+ extern PyTypeObject _Py_GenericAliasIterType;
+@@ -1897,7 +1897,7 @@
+     &PyFunction_Type,
+     &PyGen_Type,
+     &PyGetSetDescr_Type,
+-#ifdef MS_WINDOWS
++#if defined(MS_WINDOWS) && !defined(WWHD_UWP)
+     &PyHKEY_Type,
+ #endif
+     &PyInstanceMethod_Type,
+--- a/Parser/myreadline.c
++++ b/Parser/myreadline.c
+@@ -12,7 +12,7 @@
+ #include "Python.h"
+ #include "pycore_fileutils.h"     // _Py_BEGIN_SUPPRESS_IPH
+ #include "pycore_pystate.h"   // _PyThreadState_GET()
+-#ifdef MS_WINDOWS
++#if defined(MS_WINDOWS) && !defined(WWHD_UWP)
+ #  define WIN32_LEAN_AND_MEAN
+ #  include "windows.h"
+ #endif /* MS_WINDOWS */
+@@ -30,7 +30,7 @@
+ static int
+ my_fgets(PyThreadState* tstate, char *buf, int len, FILE *fp)
+ {
+-#ifdef MS_WINDOWS
++#if defined(MS_WINDOWS) && !defined(WWHD_UWP)
+     HANDLE handle;
+     _Py_BEGIN_SUPPRESS_IPH
+     handle = (HANDLE)_get_osfhandle(fileno(fp));
+@@ -55,7 +55,7 @@
+         }
+         int err = errno;
+
+-#ifdef MS_WINDOWS
++#if defined(MS_WINDOWS) && !defined(WWHD_UWP)
+         /* Ctrl-C anywhere on the line or Ctrl-Z if the only character
+            on a line will set ERROR_OPERATION_ABORTED. Under normal
+            circumstances Ctrl-C will also have caused the SIGINT handler
+@@ -108,7 +108,7 @@
+     /* NOTREACHED */
+ }
+
+-#ifdef MS_WINDOWS
++#if defined(MS_WINDOWS) && !defined(WWHD_UWP)
+ /* Readline implementation using ReadConsoleW */
+
+ extern char _get_console_type(HANDLE handle);
+@@ -246,7 +246,7 @@
+     PyThreadState *tstate = _PyOS_ReadlineTState;
+     assert(tstate != NULL);
+
+-#ifdef MS_WINDOWS
++#if defined(MS_WINDOWS) && !defined(WWHD_UWP)
+     if (!Py_LegacyWindowsStdioFlag && sys_stdin == stdin) {
+         HANDLE hStdIn, hStdErr;
+
+--- a/Python/pylifecycle.c
++++ b/Python/pylifecycle.c
+@@ -59,6 +59,11 @@
+        (PyObject_TypeCheck((op), &PyWindowsConsoleIO_Type))
+ #endif
+
++#ifdef WWHD_UWP
++#undef PyWindowsConsoleIO_Check
++#define PyWindowsConsoleIO_Check(op) 0
++#endif
++
+ #define PUTS(fd, str) _Py_write_noraise(fd, str, (int)strlen(str))
+
+
+--- a/Lib/importlib/_bootstrap_external.py
++++ b/Lib/importlib/_bootstrap_external.py
+@@ -33,7 +33,10 @@
+ _MS_WINDOWS = (sys.platform == 'win32')
+ if _MS_WINDOWS:
+     import nt as _os
+-    import winreg
++    try:
++        import winreg
++    except ImportError:
++        winreg = None
+ else:
+     import posix as _os
+
+@@ -869,6 +872,8 @@
+
+     @classmethod
+     def _search_registry(cls, fullname):
++        if winreg is None:
++            return None
+         if cls.DEBUG_BUILD:
+             registry_key = cls.REGISTRY_KEY_DEBUG
+         else:

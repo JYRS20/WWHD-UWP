@@ -5,6 +5,9 @@
 - [Mesa-UWP](https://github.com/aerisarn/mesa-uwp), Mesa and Dozen contributors — Vulkan-to-Direct3D 12 implementation.
 - [SDL3 UWP](https://github.com/rodrigoandrigo/SDL3_UWP) and SDL contributors — UWP windowing, controller input and audio.
 - [Cemu](https://github.com/cemu-project/Cemu) contributors — Latte shader translation and surface-addressing code used upstream.
+- CPython contributors — embedded Python interpreter; Python Software Foundation license.
+- LLVM/Clang contributors — on-console compilation and native object linking; Apache-2.0 with LLVM exceptions.
+- Manrope Project Authors — menu typography; SIL Open Font License 1.1 (see `platforms/uwp-game/Assets/Menu/Manrope-OFL.txt`).
 - Dear ImGui, fmt, stb, xxHash, glslang, zlib and LZ4 contributors — supporting libraries; their licenses apply.
 - [JYRS20](https://github.com/JYRS20) — UWP adaptation, integration and Xbox Series S testing.
 

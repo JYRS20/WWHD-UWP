@@ -13,6 +13,14 @@
 #include <fstream>
 #include <string>
 #include <vector>
+#include <exception>
+#ifdef WWHD_DYNAMIC_GAMECODE
+#include "dynamic_game.h"
+#ifdef WWHD_UNIFIED_PREPARATION
+#include "preparation.h"
+#endif
+#include <winrt/Windows.System.h>
+#endif
 int wwhd_game_main(int,char**);
 // Initial USB convention for the experimental build; assets stay on the drive.
 static std::filesystem::path find_usb_game(){
@@ -44,6 +52,46 @@ static std::filesystem::path find_usb_game(){
  });worker.join();return result;
 }
 
+#ifdef WWHD_DYNAMIC_GAMECODE
+struct PreparedGame {std::filesystem::path game,objects;};
+static PreparedGame find_dynamic_game(){
+ PreparedGame result;std::exception_ptr failure;
+ std::thread worker([&]{
+  winrt::init_apartment(winrt::apartment_type::multi_threaded);
+  try{
+   using namespace winrt::Windows::Storage;
+   std::vector<StorageFolder> roots;
+   auto local=ApplicationData::Current().LocalFolder();
+   // Local validation configuration is never included in the APPX.
+   try{auto config=local.GetFileAsync(L"dynamic-test-root.txt").get();roots.push_back(StorageFolder::GetFolderFromPathAsync(FileIO::ReadTextAsync(config).get()).get());}catch(winrt::hresult_error const&){}
+   for(auto const& drive:KnownFolders::RemovableDevices().GetFoldersAsync().get())roots.push_back(drive);
+   for(auto const& drive:roots){
+    StorageFolder prep{nullptr};
+    try{prep=drive.GetFolderAsync(L"WWHD-UWP-Preparation").get();}catch(winrt::hresult_error const&){continue;}
+    for(auto const& job:prep.GetFoldersAsync().get()){
+     if(std::wstring(job.Name().c_str()).rfind(L"import",0)!=0)continue;
+     try{
+      auto game=job.GetFolderAsync(L"game").get();auto code=game.GetFolderAsync(L"code").get();(void)code.GetFileAsync(L"cking.rpx").get();
+      (void)game.GetFolderAsync(L"content").get();(void)game.GetFolderAsync(L"meta").get();
+      auto generated=job.GetFolderAsync(L"generated").get();
+      for(auto const& objects:generated.GetFoldersAsync().get()){
+       if(std::wstring(objects.Name().c_str()).rfind(L"objects",0)!=0)continue;
+       try{(void)objects.GetFileAsync(L"compilation-complete.json").get();}catch(winrt::hresult_error const&){continue;}
+       winrt::Windows::Storage::AccessCache::StorageApplicationPermissions::FutureAccessList().AddOrReplace(L"wwhd-dynamic-game",game);
+       result.game=std::wstring(game.Path());result.objects=std::wstring(objects.Path());break;
+      }
+     }catch(winrt::hresult_error const&){}
+     if(!result.game.empty())break;
+    }
+    if(!result.game.empty())break;
+   }
+  }catch(winrt::hresult_error const& e){failure=std::make_exception_ptr(std::runtime_error(winrt::to_string(e.message())));}
+   catch(...){failure=std::current_exception();}
+  winrt::uninit_apartment();
+ });worker.join();if(failure)std::rethrow_exception(failure);return result;
+}
+#endif
+
 static int SDLCALL run_game(int,char**){
  try{
   auto local=std::filesystem::path(std::wstring(winrt::Windows::Storage::ApplicationData::Current().LocalFolder().Path()));
@@ -67,7 +115,13 @@ static int SDLCALL run_game(int,char**){
   FILE* stream=nullptr;freopen_s(&stream,as_utf8(user/L"wwhd-console.log").c_str(),"w",stderr);
   // Diagnostic build: aggregate reports by default; no graphics or interpolation settings change.
   // LocalState/performance-mode.txt: cpu (default), detailed (per-draw/pass), off (baseline).
-  std::string perfMode="cpu",requestedMode;
+  std::string perfMode=
+#ifdef WWHD_UNIFIED_PREPARATION
+  "off";
+#else
+  "cpu";
+#endif
+  std::string requestedMode;
   std::ifstream perfFile(local/L"performance-mode.txt");
   if(perfFile&&std::getline(perfFile,requestedMode)) {
    if(!requestedMode.empty()&&requestedMode.back()=='\r')requestedMode.pop_back();
@@ -93,16 +147,31 @@ static int SDLCALL run_game(int,char**){
   }
   std::vector<std::string> arguments{"wwhd-uwp-game","--game",gamePath,"--save",savePath,"--renderer=vulkan"};
   std::ifstream mode(local/L"test-mode.txt");std::string testMode;if(mode&&std::getline(mode,testMode)&&testMode=="renderer-smoke")arguments.emplace_back("--renderer-smoke");
-  if(testMode=="boot-capture"){
-   _putenv_s("WWHD_DUMP_FRAMES","1,30,120");_putenv_s("WWHD_DUMP_PRESENT","1");_putenv_s("WWHD_EXIT_AT_FRAME","180");
+  if(testMode=="boot-capture"||testMode=="boot-trace"||testMode=="boot-capture-long"){
+   if(testMode=="boot-trace"){arguments.emplace_back("--trace");g_ppc_trace=1;_putenv_s("WWHD_BOOTDBG","1");}
+   _putenv_s("WWHD_DUMP_FRAMES",testMode=="boot-capture-long"?"1,120,600":"1,30,120");_putenv_s("WWHD_DUMP_PRESENT","1");_putenv_s("WWHD_EXIT_AT_FRAME",testMode=="boot-capture-long"?"900":"180");
   }
   std::vector<char*> argv;for(auto& arg:arguments)argv.push_back(arg.data());argv.push_back(nullptr);
+#ifdef WWHD_DYNAMIC_GAMECODE
+  if(winrt::Windows::System::MemoryManager::AppMemoryUsageLimit()<(uint64_t(2)<<30))throw std::runtime_error("Set this application to Game in Dev Home and restart.");
+  #ifdef WWHD_UNIFIED_PREPARATION
+  auto prepared=wwhd_prepare_and_load();
+  if(prepared.game.empty())return 0;
+#else
+  auto prepared=find_dynamic_game();
+  if(prepared.game.empty())throw std::runtime_error("No completed USB preparation found. Keep WWHD-UWP-Preparation from the 0.0.3.0 compiler test.");
+  fprintf(stderr,"[dynamic] game=%s\n[dynamic] objects=%s\n",as_utf8(prepared.game).c_str(),as_utf8(prepared.objects).c_str());
+  dynamic_game_load(prepared.objects.wstring(),(prepared.game/L"code"/L"cking.rpx").wstring());
+#endif
+  arguments[2]=as_utf8(prepared.game);argv.clear();for(auto& arg:arguments)argv.push_back(arg.data());argv.push_back(nullptr);
+#else
   if(testMode!="renderer-smoke"&&!std::filesystem::is_regular_file(game/L"code"/L"cking.rpx")){
    auto usb=find_usb_game();
    if(usb.empty())throw std::runtime_error("No extracted WWHD game found. Put your USA v0 code, content and meta folders in USB:\\WWHD, or LocalState/WWHD/game. Extract WUD/WUX/WUA images on the PC first.");
    arguments[2]=as_utf8(usb);argv.clear();for(auto& arg:arguments)argv.push_back(arg.data());argv.push_back(nullptr);
   }
+#endif
   return wwhd_game_main(int(arguments.size()),argv.data());
- }catch(std::exception const& e){OutputDebugStringA(e.what());SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR,"WWHD UWP startup",e.what(),nullptr);return 1;}
+ }catch(std::exception const& e){fprintf(stderr,"[uwp startup] FAIL: %s\n",e.what());fflush(stderr);OutputDebugStringA(e.what());SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR,"WWHD UWP startup",e.what(),nullptr);return 1;}
 }
 int WINAPI wWinMain(HINSTANCE,HINSTANCE,PWSTR,int){return SDL_RunApp(0,nullptr,run_game,nullptr);}

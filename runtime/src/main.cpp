@@ -216,6 +216,11 @@ static LONG WINAPI crash_handler(EXCEPTION_POINTERS* ex) {
         line[n++]='\n'; win_crash_out(fd,line,n);
     }
     if(Cpu* c=threads::current()){n=snprintf(buf,sizeof buf,"guest lr=%08X ctr=%08X\n",c->lr,c->ctr); win_crash_out(fd,buf,n);}
+#ifdef WWHD_DYNAMIC_GAMECODE
+    if(Cpu* c=threads::current())for(unsigned i=0;i<32;i+=4){
+        n=snprintf(buf,sizeof buf,"r%u=%08X r%u=%08X r%u=%08X r%u=%08X\n",i,c->r[i],i+1,c->r[i+1],i+2,c->r[i+2],i+3,c->r[i+3]);win_crash_out(fd,buf,n);
+    }
+#endif
     crash_addr::host_backtrace(fd,win_crash_out,ex->ContextRecord);
     crash_context::note(fd,win_crash_out);
     crashrec::crash_note(fd,win_crash_out);

@@ -39,3 +39,6 @@ captures/
 *.sh
 *.py
 .github/workflows/
+
+# In-process preparation is application source, not personal automation.
+!platforms/uwp-game/prepare_game.py

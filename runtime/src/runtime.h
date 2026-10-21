@@ -131,6 +131,7 @@ struct HleReg {
 };
 PpcFunc hle_find(const char* lib, const char* name);  // null if not implemented
 PpcFunc hle_find_any(const char* name);
+void hle_visit(void (*visitor)(void*,const char*,const char*,PpcFunc),void* context);
 
 struct GuestExit { uint32_t value; };
 #define HLE(lib, name)                                                        \

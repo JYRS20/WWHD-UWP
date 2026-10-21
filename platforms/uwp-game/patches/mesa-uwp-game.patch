@@ -3,7 +3,7 @@
 @@ -930,7 +930,7 @@
    pre_args += '-DALLOW_KCMP'
  endif
- 
+
 -prog_python = import('python').find_installation('python3')
 +prog_python = import('python').find_installation()
  has_mako = run_command(
@@ -23,7 +23,7 @@
 @@ -100,10 +100,12 @@
     if (FAILED(version_info->GetVersion(&major, &minor)))
        return NO_DXIL_VALIDATION;
- 
+
 +   // Local probe: this compiler emits PSV2, so target DXIL validation 1.7.
 +   // Validation/signing still uses the real installed validator.
     if (major == 1)
@@ -34,85 +34,12 @@
 +      return DXIL_VALIDATOR_1_7;
     return NO_DXIL_VALIDATION;
  }
- 
---- a/src/microsoft/vulkan/dzn_cmd_buffer.c
-+++ b/src/microsoft/vulkan/dzn_cmd_buffer.c
-@@ -29,6 +29,7 @@
- #include "vk_util.h"
- 
- #include "dxil_spirv_nir.h"
-+#include <directx/d3d12sdklayers.h>
- 
- static void
- dzn_cmd_buffer_exec_transition_barriers(struct dzn_cmd_buffer *cmdbuf,
-@@ -670,6 +671,11 @@
-    cmdbuf->valid_sync = cmd_buffer_valid_sync[type];
-    cmdbuf->valid_access = cmd_buffer_valid_access[type];
-    cmdbuf->enhanced_barriers = pdev->options12.EnhancedBarriersSupported;
-+   {
-+      const char *no_eb = getenv("DZN_NO_ENHANCED_BARRIERS");
-+      if (no_eb && (!strcmp(no_eb, "1") || !strcmp(no_eb, "true")))
-+         cmdbuf->enhanced_barriers = false;
-+   }
- 
- out:
-    if (result != VK_SUCCESS)
-@@ -1071,8 +1077,31 @@
-       dzn_cmd_buffer_gather_events(cmdbuf);
-       dzn_cmd_buffer_gather_queries(cmdbuf);
-       HRESULT hres = ID3D12GraphicsCommandList1_Close(cmdbuf->cmdlist);
--      if (FAILED(hres))
-+      if (FAILED(hres)) {
-+         struct dzn_device *device = container_of(cmdbuf->vk.base.device, struct dzn_device, vk);
-+         HRESULT removed = ID3D12Device_GetDeviceRemovedReason(device->dev);
-+         fprintf(stderr, "[dozen] ID3D12GraphicsCommandList1_Close failed hr=0x%08lx, DeviceRemovedReason=0x%08lx\n", (unsigned long)hres, (unsigned long)removed);
-+         ID3D12InfoQueue *info_queue = NULL;
-+         if (SUCCEEDED(ID3D12Device1_QueryInterface(device->dev, &IID_ID3D12InfoQueue, (void **)&info_queue))) {
-+            UINT64 num_messages = ID3D12InfoQueue_GetNumStoredMessages(info_queue);
-+            fprintf(stderr, "[dozen] ID3D12InfoQueue stored messages: %llu\n", (unsigned long long)num_messages);
-+            for (UINT64 i = 0; i < num_messages; i++) {
-+               SIZE_T msg_size = 0;
-+               ID3D12InfoQueue_GetMessage(info_queue, i, NULL, &msg_size);
-+               if (msg_size > 0) {
-+                  D3D12_MESSAGE *msg = (D3D12_MESSAGE *)malloc(msg_size);
-+                  if (msg && SUCCEEDED(ID3D12InfoQueue_GetMessage(info_queue, i, msg, &msg_size))) {
-+                     fprintf(stderr, "[D3D12 Error %llu] %s\n", (unsigned long long)i, msg->pDescription);
-+                  }
-+                  free(msg);
-+               }
-+            }
-+            ID3D12InfoQueue_ClearStoredMessages(info_queue);
-+            ID3D12InfoQueue_Release(info_queue);
-+         }
-+         fflush(stderr);
-          vk_command_buffer_set_error(&cmdbuf->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
-+      }
-    }
- 
-    return vk_command_buffer_end(&cmdbuf->vk);
-@@ -3134,10 +3163,13 @@
-             (struct dzn_graphics_pipeline *)pipeline;
-          ID3D12GraphicsCommandList1_IASetPrimitiveTopology(cmdbuf->cmdlist, gfx->ia.topology);
-          dzn_graphics_pipeline_get_state(gfx, &cmdbuf->state.pipeline_variant);
--         if (gfx->multiview.native_view_instancing)
--            ID3D12GraphicsCommandList1_SetViewInstanceMask(cmdbuf->cmdlist, gfx->multiview.view_mask);
--         else
--            ID3D12GraphicsCommandList1_SetViewInstanceMask(cmdbuf->cmdlist, 1);
-+         struct dzn_physical_device *pdev = container_of(device->vk.physical, struct dzn_physical_device, vk);
-+         if (pdev->options3.ViewInstancingTier > D3D12_VIEW_INSTANCING_TIER_NOT_SUPPORTED) {
-+            if (gfx->multiview.native_view_instancing)
-+               ID3D12GraphicsCommandList1_SetViewInstanceMask(cmdbuf->cmdlist, gfx->multiview.view_mask);
-+            else
-+               ID3D12GraphicsCommandList1_SetViewInstanceMask(cmdbuf->cmdlist, 1);
-+         }
- 
-          if (gfx->zsa.dynamic_depth_bias && gfx->use_gs_for_polygon_mode_point)
-             cmdbuf->state.bindpoint[bindpoint].dirty |= DZN_CMD_BINDPOINT_DIRTY_SYSVALS;
+
 --- a/src/microsoft/vulkan/dzn_device.c
 +++ b/src/microsoft/vulkan/dzn_device.c
 @@ -1327,8 +1327,11 @@
           base_props->optimalTilingFeatures |= VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT;
- 
+
        if (dfmt_info.Support1 & D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL) {
 -         base_props->optimalTilingFeatures |=
 -            VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT;
@@ -123,40 +50,24 @@
 +            base_props->optimalTilingFeatures |= VK_FORMAT_FEATURE_BLIT_DST_BIT;
        }
     }
- 
-@@ -2263,7 +2266,14 @@
-                                              false);
- 
-    /* Override entrypoints with alternatives based on supported features. */
--   if (pdev->options12.EnhancedBarriersSupported) {
-+   bool enable_enhanced_barriers = pdev->options12.EnhancedBarriersSupported;
-+   const char *no_eb = getenv("DZN_NO_ENHANCED_BARRIERS");
-+   if (no_eb && (!strcmp(no_eb, "1") || !strcmp(no_eb, "true")))
-+      enable_enhanced_barriers = false;
-+   fprintf(stderr, "[dozen] EnhancedBarriersSupported=%d, using=%d\n",
-+           (int)pdev->options12.EnhancedBarriersSupported, (int)enable_enhanced_barriers);
-+   fflush(stderr);
-+   if (enable_enhanced_barriers) {
-       device->cmd_dispatch.CmdPipelineBarrier2 = dzn_CmdPipelineBarrier2_enhanced;
-    }
- 
+
 --- a/src/vulkan/wsi/wsi_common_win32.cpp
 +++ b/src/vulkan/wsi/wsi_common_win32.cpp
 @@ -84,6 +84,10 @@
- 
+
  struct wsi_win32_surface {
     VkIcdSurfaceWin32 base;
 +#ifdef _XBOX_UWP
 +   /* Private WWHD bridge: an owned ICoreWindow IUnknown, never an HWND. */
 +   IUnknown *core_window;
 +#endif
- 
+
     /* The first time a swapchain is created against this surface, a DComp
      * target/visual will be created for it and that swapchain will be bound.
 @@ -148,6 +152,30 @@
     return VK_SUCCESS;
  }
- 
+
 +#ifdef _XBOX_UWP
 +/* Private ABI, deliberately separate from vkCreateWin32SurfaceKHR's HWND contract.
 + * Caller passes CoreWindow's IUnknown and keeps all calls on the window thread.
@@ -209,7 +120,7 @@
        wsi_device->maxImageDimension2D,
 @@ -795,11 +832,26 @@
        desc.BufferUsage |= DXGI_USAGE_RENDER_TARGET_OUTPUT;
- 
+
     IDXGISwapChain1 *swapchain1;
 -   if (FAILED(factory->CreateSwapChainForComposition(queue, &desc, NULL, &swapchain1)) ||
 -       FAILED(swapchain1->QueryInterface(&chain->dxgi)))

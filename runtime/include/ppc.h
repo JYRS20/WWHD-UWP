@@ -50,11 +50,20 @@ double ppc_frsqrte(double x);
 
 #define MUSTTAIL __attribute__((musttail))
 
+/* Dynamic Windows code uses an indirection slot for runtime-owned data. Plain
+ * COFF REL32 data references cannot safely reach a separately loaded image.
+ * Static builds retain the original declarations and code generation. */
+#if defined(_WIN32) && defined(WWHD_RUNTIME_DATA_IMPORT)
+#define PPC_RUNTIME_DATA __declspec(dllimport)
+#else
+#define PPC_RUNTIME_DATA
+#endif
+
 /* optional guest function-entry trace (runtime switch, see runtime/src/trace.cpp) */
-extern int g_ppc_trace;
+extern PPC_RUNTIME_DATA int g_ppc_trace;
 void ppc_trace_enter(uint32_t addr);
 /* per-core scheduling: a higher-priority thread on this core is ready, yield at the next function entry */
-extern volatile int g_core_preempt[3];
+extern PPC_RUNTIME_DATA volatile int g_core_preempt[3];
 void ppc_preempt(Cpu* c);
 #define PPC_ENTER(a) do {                                                     \
         if (__builtin_expect(g_ppc_trace, 0)) ppc_trace_enter(a);             \
@@ -68,7 +77,7 @@ void ppc_preempt(Cpu* c);
 #if defined(__GNUC__) && !defined(_WIN32)
 __attribute__((visibility("hidden")))
 #endif
-extern uint8_t* g_mod_hook_flags;
+extern PPC_RUNTIME_DATA uint8_t* g_mod_hook_flags;
 void ppc_mod_run(Cpu* c);
 /* Do not mark this branch unlikely: Apple clang 17 can outline a cold hook
    return into an i1-returning helper, invalidating the void musttail call.
@@ -114,7 +123,7 @@ static inline uint32_t f32_as_u32(float f) { uint32_t u; memcpy(&u, &f, 4); retu
 #ifdef __cplusplus
 extern "C" {
 #endif
-extern int wwhd_snan_on;
+extern PPC_RUNTIME_DATA int wwhd_snan_on;
 void wwhd_snan_hit(int kind, uint32_t ea, uint64_t bits);  /* noinline: its return address is the call site */
 #ifdef __cplusplus
 }

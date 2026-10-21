@@ -81,11 +81,11 @@ std::string host_path_exact(const std::string& guest) {
 #ifndef _WIN32
 // Wii U volumes are case-insensitive (the game asks for Common/Audiores, the disc folder is AudioRes);
 // case-sensitive host file systems (Linux, case-sensitive APFS) need the path resolved one component
-// at a time. Exact matches cost one stat(); resolved directories are cached. Components that don't
+// at a time. Exact matches cost one host::file_stat(); resolved directories are cached. Components that don't
 // exist yet (new save files) keep the guest's spelling.
 std::string resolve_case(const std::string& p) {
     struct stat st;
-    if (stat(p.c_str(), &st) == 0) return p;
+    if (host::file_stat(p.c_str(), &st) == 0) return p;
     static std::mutex mu;
     static std::unordered_map<std::string, std::string> dirs;  // lower-cased dir path -> host dir path
     std::lock_guard<std::mutex> lk(mu);
@@ -102,7 +102,7 @@ std::string resolve_case(const std::string& p) {
         std::string cand = base + comp;
         std::string key = lower(cand);
         if (auto it = dirs.find(key); it != dirs.end()) { cur = it->second; continue; }
-        if (stat(cand.c_str(), &st) != 0) {
+        if (host::file_stat(cand.c_str(), &st) != 0) {
             std::string found;
             if (DIR* d = opendir(cur.empty() ? "." : cur.c_str())) {
                 while (dirent* de = readdir(d))
@@ -166,7 +166,7 @@ int32_t open_file(const std::string& gpath, const std::string& mode, uint32_t ou
     if (mode.find_first_of("wa") != std::string::npos) make_parent_dirs(hp);
     std::string m = mode;
     if (m.find('b') == std::string::npos) m += "b";
-    FILE* f = fopen(hp.c_str(), m.c_str());
+    FILE* f = host::open_file(hp.c_str(), m.c_str());
     TRACE("[fs] open %s (%s) -> %s", gpath.c_str(), mode.c_str(), f ? "ok" : "not found");
     if (!f) return FS_NOT_FOUND;
     const bool story = story_store::is_save_file(gpath);
@@ -194,7 +194,9 @@ FILE* file(uint32_t h) {
 int32_t stat_path(const std::string& gpath, uint32_t out) {
     struct stat st;
     const std::string hp = read_path(gpath);
-    if (stat(hp.c_str(), &st) != 0) return FS_NOT_FOUND;
+    int status=host::file_stat(hp.c_str(), &st);
+    TRACE("[fs] stat %s -> %s",gpath.c_str(),status==0?"ok":"not found");
+    if (status != 0) return FS_NOT_FOUND;
     fill_stat(out, st, game_size(gpath, hp, st));
     return FS_OK;
 }
@@ -324,7 +326,7 @@ HLE(coreinit, FSReadDir) {
         auto path=it->second.path + "/" + de->d_name;
         auto replacement=mods::content::replacement(it->second.gpath + "/" + de->d_name);
         if(!replacement.empty())path=std::move(replacement);
-        if (stat(path.c_str(), &st) != 0) continue;
+        if (host::file_stat(path.c_str(), &st) != 0) continue;
         const std::string entry = it->second.gpath + "/" + de->d_name;
         fill_stat(out, st, game_size(entry, path, st));
         mem::write_cstr(out + 0x64, de->d_name, 256);
@@ -413,7 +415,7 @@ void fs_ss_load(ss::Reader& r) {
         uint64_t pos = r.u64();
         // reopening must not truncate or create: writers continue in update mode
         std::string m = mode.find_first_of("wa+") != std::string::npos ? "r+b" : "rb";
-        FILE* f = fopen(read_path(gp,m).c_str(), m.c_str());
+        FILE* f = host::open_file(read_path(gp,m).c_str(), m.c_str());
         if (!f) {
             LOG("[savestate] cannot reopen %s", gp.c_str());
             continue;

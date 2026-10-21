@@ -25,6 +25,17 @@ typedef struct { uint32_t start; int32_t delta; } GuestStep;  /* a run of addres
 #ifdef __cplusplus
 extern "C" {
 #endif
+#ifdef WWHD_DYNAMIC_GAMECODE
+extern const GuestStep* g_guest_code_steps;
+extern unsigned g_guest_code_step_count;
+extern const GuestStep* g_guest_data_steps;
+extern unsigned g_guest_data_step_count;
+extern uint32_t g_guest_code_lo, g_guest_code_hi, g_guest_data_lo, g_guest_data_hi;
+extern const GuestChanged* g_guest_changed_code;
+extern unsigned g_guest_changed_code_count;
+extern const char* g_guest_build_name;
+extern const char* g_guest_build_title_id;
+#else
 extern const GuestStep g_guest_code_steps[];
 extern const unsigned g_guest_code_step_count;
 extern const GuestStep g_guest_data_steps[];
@@ -34,6 +45,7 @@ extern const GuestChanged g_guest_changed_code[];
 extern const unsigned g_guest_changed_code_count;
 extern const char g_guest_build_name[];     /* "USA", "EU", ... */
 extern const char g_guest_build_title_id[];
+#endif
 #ifdef __cplusplus
 }
 #endif

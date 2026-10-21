@@ -8,6 +8,7 @@
 #include "write_watch.h"
 #ifdef WWHD_UWP
 #include "mods/guest_mods.h"
+#include "platform/file_access.h"
 #endif
 #include <zlib.h>
 #ifdef __ANDROID__
@@ -228,9 +229,20 @@ static uint32_t be32(const uint8_t* p) { return (uint32_t)p[0] << 24 | p[1] << 1
 static uint16_t be16(const uint8_t* p) { return (uint16_t)(p[0] << 8 | p[1]); }
 
 bool load_rpx(const std::string& path, LoadedModule& out) {
+#ifdef WWHD_UWP
+    auto native=std::filesystem::u8path(path);
+    HANDLE input=host::create_file(native.c_str(),GENERIC_READ,FILE_SHARE_READ,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL);
+    if(input==INVALID_HANDLE_VALUE)return false;
+    LARGE_INTEGER length{};
+    if(!GetFileSizeEx(input,&length)||length.QuadPart<64||length.QuadPart>(64ll<<20)){CloseHandle(input);return false;}
+    std::vector<uint8_t> d(size_t(length.QuadPart));DWORD actual=0;
+    bool read_ok=ReadFile(input,d.data(),DWORD(d.size()),&actual,nullptr)&&actual==d.size();
+    CloseHandle(input);if(!read_ok)return false;
+#else
     std::ifstream f(path, std::ios::binary);
     if (!f) return false;
     std::vector<uint8_t> d((std::istreambuf_iterator<char>(f)), {});
+#endif
     uint32_t shoff = be32(&d[0x20]);
     uint16_t shentsize = be16(&d[0x2E]), shnum = be16(&d[0x30]);
     out.entry = be32(&d[0x18]);
@@ -381,6 +393,10 @@ static std::vector<HleReg*>& hle_registry() {
     return r;
 }
 HleReg::HleReg(const char* l, const char* n, PpcFunc f) : lib(l), name(n), fn(f) { hle_registry().push_back(this); }
+
+void hle_visit(void (*visitor)(void*,const char*,const char*,PpcFunc),void* context) {
+    for (const auto* item:hle_registry())visitor(context,item->lib,item->name,item->fn);
+}
 
 PpcFunc hle_find(const char* lib, const char* name) {
     std::string l = lib;
