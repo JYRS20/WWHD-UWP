@@ -8,7 +8,6 @@ UWP adaptation of [ZeldaWWHDRecomp](https://github.com/ZeldaWWHDRecomp/ZeldaWWHD
 
 - Select your WUX/WUD from any folder on USB.
 - Extract, translate, compile and verify your own game directly on the console. Prepared files remain on USB and are reused on later launches.
-- English selection and progress interface, designed for 1080p in 16:9.
 - Upstream graphics, controller, audio and gameplay settings.
 - Vulkan rendering through Mesa Dozen / Direct3D 12 and UWP input, storage and lifecycle support.
 
