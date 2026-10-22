@@ -17,8 +17,6 @@ Download the ZIP from [Releases](https://github.com/JYRS20/WWHD-UWP/releases), i
 
 Keep your original USA WUX/WUD, matching disc `.key` and `common.key` together on USB. Allow at least 3 GiB of additional free space. Choose **Browse USB**, select the image and keep the drive connected during preparation and gameplay. Later, choose **Play game**.
 
-Version 0.1.2 has an isolated startup crash report from the graphics driver. Restarting succeeded in the reported session; the fix under testing is not included in this release.
-
 ## Source and credits
 
 This repository is a source overlay for upstream commit `f10b56621ed13e0053e7cf8190e740834377e45a`. It includes the UWP adaptation and embedded preparation hosts. Public upstream tooling and external dependencies are required to build it.
