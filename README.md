@@ -4,6 +4,8 @@ UWP adaptation of [ZeldaWWHDRecomp](https://github.com/ZeldaWWHDRecomp/ZeldaWWHD
 
 **Playable at 30 FPS on Xbox Series S, based on user testing.**
 
+**This port is experimental. Work is ongoing to improve performance and optimize the runtime.**
+
 ## Features
 
 - Select your WUX/WUD from any folder on USB.
