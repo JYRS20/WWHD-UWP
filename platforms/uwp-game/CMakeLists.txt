@@ -94,7 +94,7 @@ set(NPC "${CMAKE_BINARY_DIR}/generated/npc_recipes.cpp")
 add_custom_command(OUTPUT "${NPC}" COMMAND ${CMAKE_COMMAND} "-DDIR=${WWHD_ROOT}/runtime/assets/npc_catalogue" "-DOUT=${NPC}" -P "${WWHD_ROOT}/cmake/EmbedNpcRecipes.cmake" VERBATIM)
 set(BAG "${CMAKE_BINARY_DIR}/generated/story_bag_layout.cpp")
 add_custom_command(OUTPUT "${BAG}" COMMAND ${CMAKE_COMMAND} "-DIN=${WWHD_ROOT}/runtime/assets/story_bag/StoryBag_00.json" "-DOUT=${BAG}" -DSYMBOL=wwhd_story_bag_layout -P "${WWHD_ROOT}/cmake/EmbedBytes.cmake" VERBATIM)
-add_executable(wwhd-uwp-game WIN32 entry.cpp ${RUNTIME_SOURCES} ${GX2_SOURCES} ${VULKAN_SOURCES}
+add_executable(wwhd-uwp-game WIN32 entry.cpp "${WWHD_ROOT}/runtime/src/platform/uwp_browser.cpp" ${RUNTIME_SOURCES} ${GX2_SOURCES} ${VULKAN_SOURCES}
  "${WWHD_ROOT}/runtime/src/gfx/renderer.cpp" "${WWHD_ROOT}/runtime/src/gfx/display_modes.cpp" "${WWHD_ROOT}/runtime/src/gfx/gamepad_ui_state.cpp"
  "${WWHD_ROOT}/runtime/src/platform/input_sdl.cpp" "${WWHD_ROOT}/runtime/src/platform/mouse_sdl.cpp" "${WWHD_ROOT}/runtime/src/platform/display_rate.cpp"
  "${WWHD_ROOT}/runtime/src/platform/perf_hint.cpp" "${WWHD_ROOT}/runtime/src/platform/thread_sampler.cpp" "${WWHD_ROOT}/runtime/src/platform/touch_pad.cpp" "${WWHD_ROOT}/runtime/src/platform/https_win.cpp" "${BUILD_INFO}" "${NPC}" "${BAG}")

@@ -107,7 +107,7 @@ struct Renderer::Impl {
  }
  void header(bool connected){
   text(64,50,"WWHD",Title);rounded(174,51,59,34,6,selected);text(186,57,"UWP",Label,accent);
-  std::string status=connected?"USB connected":"USB not connected";float x=1216-fonts[Small].width(status);if(connected)icon(Icon::Connected,x-18,65);text(x,55,status,Small,muted);
+  std::string status=connected?"Storage available":"No storage available";float x=1216-fonts[Small].width(status);if(connected)icon(Icon::Connected,x-18,65);text(x,55,status,Small,muted);
  }
  void heading(const std::string& title,const std::string& subtitle){text(64,116,title,Hero);text(64,182,subtitle,Body,muted);}
  void hint(float& x,const std::string& key,const std::string& label){float width=(std::max)(26.f,fonts[Label].width(key)+16);panel(x,647,width,28,false,6);text(x+(width-fonts[Label].width(key))/2,650,key,Label,accent);text(x+width+9,648,label,Small,muted);x+=width+9+fonts[Small].width(label)+28;}
@@ -117,29 +117,29 @@ struct Renderer::Impl {
  void card(const Row& row,float y,float h,bool focus){
   panel(64,y,1152,h,focus);icon(row.icon,88,y+(h-32)/2);text(144,y+(h-70)/2,row.title,Title,white,700);text(144,y+(h-70)/2+42,row.subtitle,Small,muted,770);
   if(row.ready)right(1010,y+(h-22)/2,"READY",Label,accent);
-  float button_width=row.ready?148.f:160.f;button(1192-button_width,y+(h-56)/2,button_width,focus?(row.ready?"A  Play":"A  Select"):(row.ready?"Play":"Browse"),focus);
+  float button_width=row.ready?148.f:160.f;const bool prepare=row.tag=="EXTRACTED GAME"||row.tag=="GAME IMAGE"||row.tag=="CHECK KEYS";button(1192-button_width,y+(h-56)/2,button_width,focus?(row.ready?"A  Play":"A  Select"):(row.ready?"Play":prepare?"Prepare":"Browse"),focus);
  }
  void main(const View& view){
   heading("The Wind Waker HD","Choose your game and set sail.");
-  if(view.rows.empty()){panel(64,240,1152,124);text(88,266,view.loading?"Looking for USB drives...":"No USB drive found",Title);text(88,310,"Connect your USB, then press X to refresh.",Small,muted);}
+  if(view.rows.empty()){panel(64,240,1152,124);text(88,266,view.loading?"Looking for games...":"No game found",Title);text(88,310,"Upload files to LocalState / WWHD / Games, or connect a USB.",Small,muted);}
   size_t first=view.selected>=3?view.selected-2:0;float y=240;
   for(size_t i=first;i<view.rows.size()&&i<first+3;++i){float h=i==first?124.f:104.f;card(view.rows[i],y,h,i==view.selected);y+=h+16;}
   if(view.rows.size()>3)right(1216,214,std::to_string(view.selected+1)+" / "+std::to_string(view.rows.size()),Label);
   footer(false);
  }
  void browser(const View& view){
-  heading("Browse USB","Select your game image. Keep both keys in the same folder.");icon(Icon::Folder,64,240);text(108,243,view.folder,Small,muted,1108,true);
+  heading("Browse storage","Select a WUX/WUD image or a folder with code, content and meta.");icon(Icon::Folder,64,240);text(108,243,view.folder,Small,muted,1108,true);
   size_t first=view.selected>=3?view.selected-2:0;float y=300;
   for(size_t i=first;i<view.rows.size()&&i<first+3;++i){const auto& row=view.rows[i];bool focus=i==view.selected;panel(64,y,1152,68,focus,10);icon(row.icon,84,y+18);text(134,y+19,row.title,Body,white,800);right(1196,y+21,focus?"A  SELECT":row.tag,Small,focus?accent:muted);y+=78;}
-  if(view.rows.empty())text(84,324,view.loading?"Reading folder...":"No game image in this folder.",Body,muted);
+  if(view.rows.empty())text(84,324,view.loading?"Reading folder...":"No supported game in this folder.",Body,muted);
   if(view.keys_visible){icon(Icon::Disc,84,y+12);text(134,y+13,"Key files",Body);right(1196,y+15,view.keys_ready?"Both keys found":"Keys missing or ambiguous",Small,view.keys_ready?accent:muted);text(64,y+66,"Keys are detected automatically. Select the WUX or WUD to continue.",Small,muted);}
-  else text(64,586,"Open a folder to find your WUX or WUD game image.",Small,muted);
+  else text(64,586,"Open your extracted game folder, or find a WUX/WUD image.",Small,muted);
   if(view.rows.size()>3)right(1216,270,std::to_string(view.selected+1)+" / "+std::to_string(view.rows.size()),Label);
   footer(true);
  }
  void progress(const View& view){
   bool cached=view.stage=="Preparing to launch...";
-  heading("Preparing your game",cached?"Checking your prepared game. It will start shortly.":"This only needs to run once. Keep your USB connected.");
+  heading("Preparing your game",cached?"Checking your prepared game. It will start shortly.":"This only needs to run once. Keep your Storage available.");
   panel(64,240,1152,286);icon(Icon::Disc,92,268);text(140,269,view.game.empty()?"The Wind Waker HD":view.game,Body,white,1036);
   text(92,324,view.stage,Title,white,940);right(1188,324,std::to_string(view.percent)+"%",Title,accent);
   rounded(92,394,1096,12,6,border);rounded(92,394,1096*(std::min)(100u,view.percent)/100.f,12,6,accent);text(92,430,view.detail,Small,muted,1096);

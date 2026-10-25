@@ -51,10 +51,18 @@ bool preparation_stats_enabled() {
   static const bool enabled=std::getenv("WWHD_VK_STATS")!=nullptr;
   return enabled;
 }
-// Bounded overlap: the default on every platform (measured on macOS and Windows); an explicit
+// Bounded overlap; UWP uses smaller lists to limit Dozen temporary resources. An explicit
 // zero/invalid WWHD_VK_DRAW_BATCH disables it.
 uint32_t parse_draw_batch(const char* text) {
-  if (!text) return 2048;
+  if (!text) {
+#ifdef WWHD_UWP
+    // Dozen retains internal conversion buffers until submission retirement.
+    // Bound command-list growth even during unusually heavy loading frames.
+    return 512;
+#else
+    return 2048;
+#endif
+  }
   if (!*text) return 0;
   uint32_t value = 0;
   for (const char* p = text; *p; ++p) {
@@ -66,7 +74,15 @@ uint32_t parse_draw_batch(const char* text) {
   return value;
 }
 uint32_t parse_draw_batch_cap(const char* text) {
-  if (!text) return 3;
+  if (!text) {
+#ifdef WWHD_UWP
+    // A per-frame cap leaves the remaining command list unbounded. The four
+    // fenced submission slots already bound concurrent GPU ownership.
+    return UINT32_MAX;
+#else
+    return 3;
+#endif
+  }
   // Explicit invalid caps retain the original conservative fallback.
   const uint32_t value = parse_draw_batch(text);
   return value >= 1 && value <= 3 ? value : 2;

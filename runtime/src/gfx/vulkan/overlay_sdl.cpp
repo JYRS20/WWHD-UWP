@@ -12,6 +12,9 @@
 #include "input.h"
 #include "interp.h"
 #include "overlay/hostui.h"
+#ifdef WWHD_UWP
+#include "platform/uwp_browser.h"
+#endif
 #include "platform/host.h"
 #include "platform/perf_hint.h"
 #include "platform/dual_display.h"
@@ -114,6 +117,9 @@ void post(std::function<void()> fn) {
     std::lock_guard<std::mutex> lk(g_mu);
     g_posted.push_back(std::move(fn));
 }
+#ifdef WWHD_UWP
+void choose_mod_source(bool folder,std::function<void(std::string)> chosen){uwp_browser::choose_mod(folder,std::move(chosen));}
+#else
 void choose_mod_source(bool folder, std::function<void(std::string)> chosen) {
     post([folder, chosen] {
         auto callback = new std::function<void(std::string)>(chosen);
@@ -126,6 +132,8 @@ void choose_mod_source(bool folder, std::function<void(std::string)> chosen) {
         else SDL_ShowOpenFileDialog(done, callback, nullptr, nullptr, 0, nullptr, false);
     });
 }
+#endif
+
 void choose_game_source(bool folder, std::function<void(std::string)> chosen) {
     post([folder, chosen] {
         auto callback = new std::function<void(std::string)>(chosen);
@@ -341,7 +349,7 @@ void set_pro_controller(bool on) {
 }
 const char* name() { return "SDL"; }
 void set_clipboard(const std::string& text) { SDL_SetClipboardText(text.c_str()); }
-#ifdef __ANDROID__
+#if defined(__ANDROID__) || defined(WWHD_UWP)
 bool can_open_folder() { return false; }  // app-private storage: no file manager shows it
 void open_folder(const std::string&) {}
 #else

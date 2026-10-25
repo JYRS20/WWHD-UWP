@@ -12,6 +12,8 @@
 #include <winrt/Windows.Storage.h>
 #include <winrt/Windows.Storage.FileProperties.h>
 #include <winrt/Windows.Storage.AccessCache.h>
+#include <bcrypt.h>
+#include <array>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -31,13 +33,13 @@ struct Choice {
  Action action=Action::Launch;
  std::string label;
  StorageFolder folder{nullptr};
- StorageFolder drive{nullptr},game{nullptr},objects{nullptr};
+ StorageFolder drive{nullptr},game{nullptr},objects{nullptr},source{nullptr};
  StorageFile image{nullptr},disc{nullptr},common{nullptr};
 };
 struct State {
  std::mutex mutex;
  std::vector<Choice> choices;
- std::string stage="Looking for USB drives...",detail,error,python_line,folder_path,display_game;
+ std::string stage="Looking for games...",detail,error,python_line,folder_path,display_game;
  bool browsing=false;
  std::atomic<int> percent{0};
  std::atomic<bool> finished{false},cancel{false};
@@ -55,9 +57,9 @@ std::string read(const fs::path& path,size_t limit=1u<<20){
  return text;
 }
 void write(const fs::path& path,const std::string& text){
- wwhd_extract::OutputFile file(path);if(!file)throw std::runtime_error("Cannot create preparation status on USB.");
+ wwhd_extract::OutputFile file(path);if(!file)throw std::runtime_error("Cannot create preparation status on the selected storage.");
  file.write(reinterpret_cast<const uint8_t*>(text.data()),text.size());
- if(!file.close())throw std::runtime_error("Cannot save preparation status. Check USB space and connection.");
+ if(!file.close())throw std::runtime_error("Cannot save preparation status. Check free space and connection.");
 }
 std::string utf8(const fs::path& path){auto s=path.u8string();return {reinterpret_cast<const char*>(s.data()),s.size()};}
 std::wstring lower(std::wstring text){for(auto& c:text)c=std::towlower(c);return text;}
@@ -99,6 +101,62 @@ void python_report(void* p,const char* bytes,size_t size){
 void fail(State& s,const std::string& error){
  report(nullptr,error.c_str());{std::lock_guard lock(s.mutex);s.error=error;}s.finished=true;
 }
+
+std::string root_name(const StorageFolder& root){
+ auto local=std::wstring(ApplicationData::Current().LocalFolder().Path());
+ auto path=std::wstring(root.Path());
+ bool internal=path.size()>local.size()&&path[local.size()]==L'\\'&&CompareStringOrdinal(path.c_str(),int(local.size()),local.c_str(),int(local.size()),TRUE)==CSTR_EQUAL;
+ return internal?"Internal storage":winrt::to_string(root.Name());
+}
+bool same_folder(const StorageFolder& a,const StorageFolder& b){
+ return CompareStringOrdinal(a.Path().c_str(),-1,b.Path().c_str(),-1,TRUE)==CSTR_EQUAL;
+}
+void game_layout(const StorageFolder& folder){
+ (void)folder.GetFolderAsync(L"code").get().GetFileAsync(L"cking.rpx").get();
+ (void)folder.GetFolderAsync(L"content").get();(void)folder.GetFolderAsync(L"meta").get();
+}
+StorageFolder prepared_folder(const StorageFolder& drive,const StorageFolder& job){
+ auto reference=job.TryGetItemAsync(L"game-source.txt").get();
+ if(!reference)return job.GetFolderAsync(L"game").get();
+ auto relative=fs::u8path(read(fs::path(reference.Path().c_str())));
+ if(relative.empty()||relative.is_absolute()||relative.has_root_path())throw std::runtime_error("Invalid prepared folder reference.");
+ for(auto const& component:relative)if(component==L"..")throw std::runtime_error("Prepared folder is outside its storage root.");
+ return relative==L"."?drive:drive.GetFolderAsync(relative.wstring()).get();
+}
+void add_prepared(std::vector<Choice>& choices,const StorageFolder& drive,const std::string& profile,StorageFolder only=nullptr){
+ try{
+  auto prep=drive.GetFolderAsync(L"WWHD-UWP-Preparation").get();
+  for(auto const& job:prep.GetFoldersAsync().get()){
+   if(std::wstring(job.Name()).rfind(L"import",0)!=0)continue;
+   try{
+    auto game=prepared_folder(drive,job);game_layout(game);if(only&&!same_folder(game,only))continue;
+    bool unified=std::wstring(job.Name()).rfind(L"import-unified",0)==0;
+    if(unified&&read(fs::path(job.GetFileAsync(L"ready-profile.txt").get().Path().c_str()))!=profile)continue;
+    auto generated=job.GetFolderAsync(L"generated").get();
+    for(auto const& objects:generated.GetFoldersAsync().get()){
+     if(std::wstring(objects.Name()).rfind(L"objects",0)!=0)continue;
+     try{(void)objects.GetFileAsync(L"compilation-complete.json").get();}catch(winrt::hresult_error const&){continue;}
+     Choice c;c.drive=drive;c.game=game;c.objects=objects;c.label="Play prepared game - "+root_name(drive);
+     choices.push_back(std::move(c));break;
+    }
+   }catch(winrt::hresult_error const&){}catch(std::exception const& e){report(nullptr,e.what());}
+  }
+ }catch(winrt::hresult_error const&){}
+}
+void add_extracted(std::vector<Choice>& choices,const StorageFolder& drive,const StorageFolder& folder,const std::string& profile){
+ try{game_layout(folder);}catch(winrt::hresult_error const&){return;}
+ for(auto const& c:choices)if(c.game&&same_folder(c.game,folder))return;
+ auto previous=choices.size();add_prepared(choices,drive,profile,folder);if(choices.size()!=previous)return;
+ Choice c;c.drive=drive;c.source=folder;c.label="Prepare folder - "+winrt::to_string(folder.Name());choices.push_back(std::move(c));
+}
+void validate_rpx(const StorageFolder& game){
+ game_layout(game);auto data=read(fs::path(game.Path().c_str())/L"code"/L"cking.rpx",32u<<20);
+ std::array<unsigned char,32> digest{};
+ auto result=BCryptHash(BCRYPT_SHA256_ALG_HANDLE,nullptr,0,reinterpret_cast<PUCHAR>(data.data()),ULONG(data.size()),digest.data(),ULONG(digest.size()));
+ if(result<0)throw std::runtime_error("Cannot verify the game executable.");
+ static constexpr unsigned char expected[32]={0xc4,0xf0,0xab,0x30,0x05,0x42,0xe0,0xbf,0xc4,0x62,0x69,0x68,0x50,0x53,0x4e,0x71,0xdb,0x2a,0xd0,0x22,0x88,0xa7,0xeb,0x55,0xe5,0xa4,0xcd,0x40,0x62,0xf1,0x61,0x53};
+ if(!std::equal(digest.begin(),digest.end(),expected))throw std::runtime_error("Unsupported game executable. Use the unmodified original USA release of The Wind Waker HD.");
+}
 void add_images(std::vector<Choice>& choices,const StorageFolder& drive,const StorageFolder& folder){
  std::vector<StorageFile> images,keys;StorageFile common{nullptr};
  for(auto const& file:folder.GetFilesAsync().get()){
@@ -127,6 +185,8 @@ void scan(State& state,StorageFolder browse_drive=nullptr,StorageFolder browse_f
   // Private validation override is never packaged or created for normal users.
   try{auto config=ApplicationData::Current().LocalFolder().GetFileAsync(L"preparation-test-root.txt").get();
       drives.push_back(StorageFolder::GetFolderFromPathAsync(FileIO::ReadTextAsync(config).get()).get());}catch(winrt::hresult_error const&){}
+  auto home=fs::path(winrt::Windows::ApplicationModel::Package::Current().InstalledLocation().Path().c_str());
+  auto profile=read(home/L"preparation-profile.txt");
   if(browse_folder){
    std::vector<Choice> choices;
    Choice back;back.action=Action::Back;back.label="[..] Back";choices.push_back(std::move(back));
@@ -136,58 +196,41 @@ void scan(State& state,StorageFolder browse_drive=nullptr,StorageFolder browse_f
      Choice c;c.action=Action::Browse;c.drive=browse_drive;c.folder=folder;
      c.label="[Folder] "+winrt::to_string(folder.Name());choices.push_back(std::move(c));
     }
+    add_extracted(choices,browse_drive,browse_folder,profile);
     add_images(choices,browse_drive,browse_folder);
    }catch(winrt::hresult_error const& e){error="Cannot read this folder. Press B to go back. "+winrt::to_string(e.message());}
    {
-    std::lock_guard lock(state.mutex);state.choices=std::move(choices);state.stage="Browse USB";state.browsing=true;state.folder_path=winrt::to_string(browse_folder.Path());
+    std::lock_guard lock(state.mutex);state.choices=std::move(choices);state.stage="Browse storage";state.browsing=true;state.folder_path=winrt::to_string(browse_folder.Path());
     auto path=winrt::to_string(browse_folder.Path());if(path.size()>128)path="..."+path.substr(path.size()-125);
     state.detail=error.empty()?path:error;
    }
    report(nullptr,("Browsing: "+winrt::to_string(browse_folder.Path())).c_str());state.finished=true;
    winrt::uninit_apartment();return;
   }
-  for(auto const& d:KnownFolders::RemovableDevices().GetFoldersAsync().get())drives.push_back(d);
-  auto home=fs::path(winrt::Windows::ApplicationModel::Package::Current().InstalledLocation().Path().c_str());
-  auto profile=read(home/L"preparation-profile.txt");
+  auto local=ApplicationData::Current().LocalFolder().CreateFolderAsync(L"WWHD",CreationCollisionOption::OpenIfExists).get();
+  drives.push_back(local.CreateFolderAsync(L"Games",CreationCollisionOption::OpenIfExists).get());
+  try{for(auto const& d:KnownFolders::RemovableDevices().GetFoldersAsync().get())drives.push_back(d);}
+  catch(winrt::hresult_error const&){report(nullptr,"USB enumeration unavailable; internal storage remains available.");}
   std::vector<Choice> choices;
   for(auto const& drive:drives){
    check_cancel(state);
    // Always expose the drive, even when its root contains no game image.
    Choice browse;browse.action=Action::Browse;browse.drive=drive;browse.folder=drive;
-   browse.label="Browse USB - "+winrt::to_string(drive.Name());choices.push_back(std::move(browse));
-   try{
-    auto prep=drive.GetFolderAsync(L"WWHD-UWP-Preparation").get();
-    for(auto const& job:prep.GetFoldersAsync().get()){
-     if(std::wstring(job.Name()).rfind(L"import",0)!=0)continue;
-     try{
-      auto game=job.GetFolderAsync(L"game").get();(void)game.GetFolderAsync(L"code").get().GetFileAsync(L"cking.rpx").get();
-      (void)game.GetFolderAsync(L"content").get();(void)game.GetFolderAsync(L"meta").get();
-      // A new pipeline profile invalidates only unified preparations; v3 objects are checked by the same signed hash profile.
-      bool unified=std::wstring(job.Name()).rfind(L"import-unified",0)==0;
-      if(unified){auto marker=job.GetFileAsync(L"ready-profile.txt").get();if(read(fs::path(marker.Path().c_str()))!=profile)continue;}
-      auto generated=job.GetFolderAsync(L"generated").get();
-      for(auto const& objects:generated.GetFoldersAsync().get()){
-       if(std::wstring(objects.Name()).rfind(L"objects",0)!=0)continue;
-       try{(void)objects.GetFileAsync(L"compilation-complete.json").get();}catch(winrt::hresult_error const&){continue;}
-       Choice c;c.drive=drive;c.game=game;c.objects=objects;
-       c.label="Play prepared game - "+winrt::to_string(drive.Name())+" / "+winrt::to_string(job.Name());choices.push_back(std::move(c));break;
-      }
-     }catch(winrt::hresult_error const&){}
-    }
-   }catch(winrt::hresult_error const&){}
+   browse.label="Browse - "+root_name(drive);choices.push_back(std::move(browse));
+   add_prepared(choices,drive,profile);
    std::vector<StorageFolder> folders{drive};
    try{folders.push_back(drive.GetFolderAsync(L"WWHD").get());}catch(winrt::hresult_error const&){}
    for(auto const& folder:folders){
-    try{add_images(choices,drive,folder);}catch(winrt::hresult_error const&){}
+    try{add_extracted(choices,drive,folder,profile);add_images(choices,drive,folder);}catch(winrt::hresult_error const&){}
    }
   }
   // Prefer current completed preparations over legacy diagnostics or a new extraction.
-  auto rank=[](const Choice& c){return !c.game?2:winrt::to_string(c.game.Path()).find("import-unified")!=std::string::npos?0:1;};
+  auto rank=[](const Choice& c){return !c.game?2:winrt::to_string(c.objects.Path()).find("import-unified")!=std::string::npos?0:1;};
   std::stable_sort(choices.begin(),choices.end(),[&](const Choice& a,const Choice& b){return rank(a)<rank(b);});
   {std::lock_guard lock(state.mutex);state.choices=std::move(choices);state.stage="Select your game";state.browsing=false;state.folder_path.clear();
-   state.detail=state.choices.empty()?"Connect a USB drive and press X to rescan.":"Choose a prepared game, an image, or Browse USB to open a folder.";}
+   state.detail=state.choices.empty()?"Connect a USB drive and press X to rescan.":"Choose a prepared game, WUX/WUD image or extracted game folder.";}
   state.finished=true;
- }catch(winrt::hresult_error const& e){fail(state,"USB access failed: "+winrt::to_string(e.message()));}
+ }catch(winrt::hresult_error const& e){fail(state,"Storage access failed: "+winrt::to_string(e.message()));}
   catch(std::exception const& e){fail(state,e.what());}
  winrt::uninit_apartment();
 }
@@ -197,24 +240,33 @@ void prepare(State& s,Choice choice){
   auto home=fs::path(winrt::Windows::ApplicationModel::Package::Current().InstalledLocation().Path().c_str());
   auto profile=read(home/L"preparation-profile.txt");StorageFolder job{nullptr};
   {std::lock_guard lock(s.mutex);s.display_game=choice.image?winrt::to_string(choice.image.Name()):"The Wind Waker HD";}
-  if(!choice.game){
-   if(!choice.common||!choice.disc)throw std::runtime_error("Place common.key and the matching disc .key next to the image. With multiple disc keys, use the image filename for its key.");
+  if(!choice.objects){
+   if(!choice.source&&(!choice.common||!choice.disc))throw std::runtime_error("Place common.key and the matching disc .key next to the image. With multiple disc keys, use the image filename for its key.");
    check_cancel(s);
-   status(s,"Checking USB space...",0);
+   if(choice.source){status(s,"Checking game folder...",0);validate_rpx(choice.source);}
+   status(s,"Checking storage space...",0);
    // Reserve headroom for ~1.8 GiB extracted assets, translated source and compiler output.
    uint64_t free=0;
    try{auto values=choice.drive.Properties().RetrievePropertiesAsync({L"System.FreeSpace"}).get();
        free=winrt::unbox_value<uint64_t>(values.Lookup(L"System.FreeSpace"));}catch(winrt::hresult_error const&){report(nullptr,"USB free-space query unavailable; write failures will stop preparation.");}
-   if(free&&free<(uint64_t(3)<<30))throw std::runtime_error("At least 3 GiB of free USB space is required for a new preparation. Existing completed games can still be played.");
+   if(free&&free<((uint64_t(choice.source?1:3))<<30))throw std::runtime_error(choice.source?"At least 1 GiB of free space is required to prepare an extracted folder.":"At least 3 GiB of free space is required to prepare a disc image.");
    auto prep=choice.drive.CreateFolderAsync(L"WWHD-UWP-Preparation",CreationCollisionOption::OpenIfExists).get();
    job=prep.CreateFolderAsync(L"import-unified",CreationCollisionOption::GenerateUniqueName).get();
-   choice.game=job.CreateFolderAsync(L"game",CreationCollisionOption::FailIfExists).get();
+   choice.game=choice.source?choice.source:job.CreateFolderAsync(L"game",CreationCollisionOption::FailIfExists).get();
    auto generated=job.CreateFolderAsync(L"generated",CreationCollisionOption::FailIfExists).get();
-   auto image=winrt::to_string(choice.image.Path()),disc=winrt::to_string(choice.disc.Path()),common=winrt::to_string(choice.common.Path()),out=winrt::to_string(choice.game.Path());
-   report(nullptr,("Selected image: "+winrt::to_string(choice.image.Name())).c_str());
-   status(s,"Extracting game...",0);
-   int extracted=wwhd_extract::extract_disc(image.c_str(),disc.c_str(),common.c_str(),out.c_str(),&s,extract_progress,report);
-   check_cancel(s);if(extracted)throw std::runtime_error("Disc extraction failed (code "+std::to_string(extracted)+"). Check the image, keys and USB space. See wwhd-console.log.");
+   if(choice.source){
+    auto relative=fs::path(choice.source.Path().c_str()).lexically_relative(fs::path(choice.drive.Path().c_str()));
+    if(relative.empty()||relative.is_absolute())throw std::runtime_error("The game folder must be on the selected storage device.");
+    for(auto const& part:relative)if(part==L"..")throw std::runtime_error("The game folder must remain on the selected storage device.");
+    write(fs::path(job.Path().c_str())/L"game-source.txt",utf8(relative));
+    report(nullptr,"Using extracted game in place; no game content copied and no disc keys required.");
+   }else{
+    auto image=winrt::to_string(choice.image.Path()),disc=winrt::to_string(choice.disc.Path()),common=winrt::to_string(choice.common.Path()),out=winrt::to_string(choice.game.Path());
+    report(nullptr,("Selected image: "+winrt::to_string(choice.image.Name())).c_str());
+    status(s,"Extracting game...",0);
+    int extracted=wwhd_extract::extract_disc(image.c_str(),disc.c_str(),common.c_str(),out.c_str(),&s,extract_progress,report);
+    check_cancel(s);if(extracted)throw std::runtime_error("Disc extraction failed (code "+std::to_string(extracted)+"). Check the image, keys and free space. See wwhd-console.log.");
+   }
    status(s,"Translating game code...",25);
    auto rpx=fs::path(choice.game.Path().c_str())/L"code"/L"cking.rpx";
    auto script=read(home/L"prepare_game.py");auto tools=home/L"Tools";
@@ -224,7 +276,7 @@ void prepare(State& s,Choice choice){
    choice.objects=generated.CreateFolderAsync(L"objects",CreationCollisionOption::FailIfExists).get();
    auto headers=home/L"CompilerHeaders";
    if(wwhd_compile::compile_generated(headers.c_str(),generated.Path().c_str(),choice.objects.Path().c_str(),&s,report,compile_progress)){
-    check_cancel(s);throw std::runtime_error("Game compilation failed. Check USB connection and free space. See wwhd-console.log.");
+    check_cancel(s);throw std::runtime_error("Game compilation failed. Check storage connection and free space. See wwhd-console.log.");
    }
   }
   check_cancel(s);
@@ -266,9 +318,10 @@ struct Screen {
   const Choice* keys=nullptr;
   for(size_t i=0;i<s.choices.size();++i){
    const auto& c=s.choices[i];wwhd_menu::Row row;view.connected|=bool(c.drive);
-   if(c.game){row.title="Play game";row.subtitle="The Wind Waker HD · USA";row.icon=wwhd_menu::Icon::Play;row.ready=true;row.tag="READY";}
+   if(c.objects){row.title="Play game";row.subtitle=root_name(c.drive)+" · The Wind Waker HD · USA";row.icon=wwhd_menu::Icon::Play;row.ready=true;row.tag="READY";}
    else if(c.action==Action::Back){auto parent_name=utf8(fs::u8path(s.folder_path).parent_path().filename());row.title=parent_name.empty()?"Back to menu":"Back to "+parent_name;row.icon=wwhd_menu::Icon::Folder;row.tag="PARENT FOLDER";}
-   else if(c.action==Action::Browse){row.title=s.browsing?winrt::to_string(c.folder.Name()):"Browse USB";row.subtitle=winrt::to_string(c.drive.Name())+" · Select a game image from any folder.";row.icon=wwhd_menu::Icon::Folder;row.tag="FOLDER";}
+   else if(c.action==Action::Browse){row.title=s.browsing?winrt::to_string(c.folder.Name()):"Browse "+root_name(c.drive);row.subtitle=root_name(c.drive)+" · Images or extracted game folders.";row.icon=wwhd_menu::Icon::Folder;row.tag="FOLDER";}
+   else if(c.source){row.title="Use this game folder";row.subtitle=winrt::to_string(c.source.Name())+" · code / content / meta";row.icon=wwhd_menu::Icon::Folder;row.tag="EXTRACTED GAME";}
    else if(c.image){row.title=s.browsing?winrt::to_string(c.image.Name()):"Prepare game";row.subtitle=winrt::to_string(c.image.Name());row.icon=wwhd_menu::Icon::Disc;row.tag=c.common&&c.disc?"GAME IMAGE":"CHECK KEYS";if(!keys||i==selected_index)keys=&c;}
    else{row.title=c.label;}
    view.rows.push_back(std::move(row));
@@ -276,7 +329,7 @@ struct Screen {
   if(view.stage=="Compiling game code..."){unsigned done=0,total=0;if(std::sscanf(view.detail.c_str(),"%u / %u files",&done,&total)==2)view.detail=std::to_string(done)+" of "+std::to_string(total)+" files compiled";}
   if(keys){view.keys_visible=true;view.keys_ready=bool(keys->disc)&&bool(keys->common);}
   // Isolated visual fixtures are enabled only by a non-packaged LocalState test file.
-  if(s.test_mode.rfind("ui-",0)==0){
+  if(s.test_mode.rfind("ui-",0)==0&&s.test_mode!="ui-storage"){
    view={};view.connected=true;view.rows={{"Play game","The Wind Waker HD · USA","READY",wwhd_menu::Icon::Play,true},{"Browse USB","Select a game image from any folder.","",wwhd_menu::Icon::Folder,false}};
    if(s.test_mode=="ui-browser"){view.browsing=true;view.folder="E:   /   Games   /   The Wind Waker HD";view.selected=1;view.rows={{"Back to Games","","PARENT FOLDER",wwhd_menu::Icon::Folder,false},{"The Wind Waker HD (USA).wux","","GAME IMAGE",wwhd_menu::Icon::Disc,false}};view.keys_visible=true;view.keys_ready=true;}
    if(s.test_mode=="ui-progress"){view.running=true;view.game="The Wind Waker HD (USA).wux";view.stage="Compiling game code...";view.detail="36 of 80 files compiled";view.percent=62;}
@@ -286,7 +339,7 @@ struct Screen {
   SDL_Texture* proof=nullptr;
   if(s.test_mode.rfind("ui-",0)==0){
    proof=SDL_CreateTexture(renderer,SDL_PIXELFORMAT_RGBA8888,SDL_TEXTUREACCESS_TARGET,1920,1080);
-   if(proof)SDL_SetRenderTarget(renderer,proof);
+   if(proof){SDL_SetRenderTarget(renderer,proof);SDL_SetRenderLogicalPresentation(renderer,1280,720,SDL_LOGICAL_PRESENTATION_LETTERBOX);}
   }
   SDL_SetRenderViewport(renderer,nullptr);
   menu->draw(view);
@@ -306,7 +359,7 @@ struct Screen {
 };
 }
 WwhdPreparedGame wwhd_prepare_and_load(){
- preparation_log=fs::current_path()/L"wwhd-prepare.log";write(preparation_log,"WWHD UWP unified preparation 0.1.2\n");
+ preparation_log=fs::current_path()/L"wwhd-prepare.log";write(preparation_log,"WWHD UWP unified preparation 0.1.4\n");
  Screen screen;State state;size_t selected=0;bool running=false,quit=false;
  StorageFolder browse_drive{nullptr},browse_folder{nullptr};std::vector<StorageFolder> parents;
  std::thread worker([&]{scan(state);});
@@ -360,7 +413,7 @@ WwhdPreparedGame wwhd_prepare_and_load(){
        if(!found)report(nullptr,"FAIL browser: nested inputs not found");quit=true;
       }
      }else for(size_t i=0;i<state.choices.size();++i){
-      bool match=state.test_mode=="prepared"?bool(state.choices[i].game):state.test_mode=="prepare"&&bool(state.choices[i].image);
+      bool match=state.test_mode=="prepared"?bool(state.choices[i].objects):state.test_mode=="folder"?bool(state.choices[i].source):state.test_mode=="prepare"&&bool(state.choices[i].image);
       if(match){selected=i;accept=true;break;}
      }
      if(state.test_mode!="browse")state.test_mode.clear();

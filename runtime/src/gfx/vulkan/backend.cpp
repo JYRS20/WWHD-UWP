@@ -1123,7 +1123,21 @@ static void submit(VkSemaphore wait = VK_NULL_HANDLE,
 #endif
   ] {
     // Use the sealed slot, never the aliases of a newer active recording.
-    vk_check(timed_call(commandEndTiming,[&]{return vkEndCommandBuffer(slot.cmd);}),"end command buffer");
+    const auto endResult=timed_call(commandEndTiming,[&]{return vkEndCommandBuffer(slot.cmd);});
+#ifdef WWHD_UWP
+    if(endResult!=VK_SUCCESS) {
+      // Preserve context before the render thread terminates; app budget and
+      // driver allocations are separate limits on Xbox.
+      uwp_driver::log_memory(R.frame,R.surfaces.size());
+      uint64_t uploadCapacity=0;size_t pending=0;
+      for(const auto& block:slot.uploadBlocks)uploadCapacity+=block.buffer.size;
+      for(const auto& submission:R.submissions)pending+=submission.pending;
+      LOG("[uwp command failure] result=%d frame=%llu draws=%llu uploads=%.1f MiB pending=%zu slots=%zu",
+          int(endResult),(unsigned long long)R.frame,(unsigned long long)R.drawCount,
+          uploadCapacity/1048576.0,pending,R.submissions.size());
+    }
+#endif
+    vk_check(endResult,"end command buffer");
     vk_check(timed_call(fenceResetTiming,[&]{return vkResetFences(R.device,1,&slot.fence);}),"reset fence");
     std::array<VkPipelineStageFlags,2> stages{VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT};
     std::array<VkSemaphore,2> waits{},signals{};

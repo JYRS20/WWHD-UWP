@@ -5,6 +5,9 @@
 // resulting ImDrawData (gfx/overlay_metal.mm, gfx/vulkan/overlay.cpp); the hosts feed input and apply
 // changes on their main thread (hostui.h).
 #include "overlay.h"
+#ifdef WWHD_UWP
+#include "platform/uwp_browser.h"
+#endif
 #include "pointer.h"
 #ifdef WWHD_SDL_HOST
 #include "window_target.h"
@@ -2072,6 +2075,9 @@ void poll_controller_shortcuts(const float* values) {
 bool shortcut_took_input() { return g_shortcut_took.exchange(false); }
 
 void set_open(bool open, OpenReason reason, KeyOrigin origin) {
+#ifdef WWHD_UWP
+    if(!open&&uwp_browser::active())return; // Finish or cancel the modal before returning input to the game.
+#endif
 #ifdef WWHD_SDL_HOST
     if (open && window_target::selected.load() == window_target::Window::None) return;
 #endif
@@ -2135,6 +2141,9 @@ bool key(int code, bool down, bool repeat, int mods, KeyOrigin origin) {
         return true;
     }
     if (code == kVK_Escape && down && !repeat) {
+#ifdef WWHD_UWP
+        if(uwp_browser::active()){push({Event::Key,code,down,0,0,mods});return true;}
+#endif
         set_open(false, OpenReason::Esc, origin);
         return true;
     }
@@ -2277,7 +2286,11 @@ ImDrawData* frame(float pw, float ph, void (*renderer_init)()) {
         ;
     U.linearized = false;
     // a mod install keeps running (and shows its progress) while the menu is closed
-    const bool mods_busy = !setup_run.id.empty() || (U.init && modsui::wants_background());
+    const bool mods_busy = !setup_run.id.empty() || (U.init && modsui::wants_background())
+#ifdef WWHD_UWP
+        || uwp_browser::active()
+#endif
+        ;
     if (!open && !perf && !text && toast.empty() && !guesthud::active() && !mods_busy && !stereoPointer && drawn_layers.empty()) {
         if (U.init) {  // forget events and pressed keys while nothing is shown
             std::lock_guard<std::mutex> lk(g_mu);
@@ -2384,6 +2397,9 @@ ImDrawData* frame(float pw, float ph, void (*renderer_init)()) {
         }
         ImGui::End();
     }
+    #ifdef WWHD_UWP
+    uwp_browser::draw();
+    #endif
     ImGui::Render();
     overlay_trace::state();
     return ImGui::GetDrawData();
