@@ -229,8 +229,14 @@ extern "C" void site_024FFD60(Cpu* c) { adjust_projection_args(c, 1, 2); }
 // a taller screen got the 16:9 picture cropped at the sides instead of Vert+.
 extern "C" void site_0250007C(Cpu* c) { adjust_projection_args(c, 3, 4, true); }
 // view_setup: mDoLib_clipper::setup(f1 fovy, f2 aspect, f3 near, f4 far)
+#ifdef WWHD_UWP
+#include "gfx/decorative_grass.h"
+#endif
 static void stereo_clipper(Cpu* c) {
     adjust_projection_args(c, 1, 2);
+#ifdef WWHD_UWP
+    decorative_grass::view_fov(float(c->f[1].ps0));
+#endif
     if (stereo::requestedMode == stereo::Off) return;
     // A conservative union of both off-axis views. Widen culling only, never
     // the visible camera. Include the largest shift at the near plane.

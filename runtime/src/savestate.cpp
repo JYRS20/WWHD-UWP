@@ -1,3 +1,4 @@
+#include "platform/uwp_write_guard.h"
 #include "mods/fast_forward.h"
 #include "mods/story_store.h"
 #include "mods/mods.h"
@@ -536,7 +537,7 @@ bool do_save(int slot) {
     if (!is_auto(slot)) render::request_tv_dump(slot_path(slot, "png"), 0);
     else crashrec::on_auto_saved(slot - crashrec::kAutoBase);
     // compress and write in the background; the game continues
-    std::thread([slot, h, payload, stage, done = take_done(slot)] {
+    uwp_write_guard::start_thread([slot, h, payload, stage, done = take_done(slot)] {
         auto t1 = std::chrono::steady_clock::now();
         bool ok;
         {
@@ -1284,7 +1285,7 @@ void request_load(int slot) {
         return;
     }
     if (g_loading.exchange(true)) return;
-    std::thread([slot] {
+    uwp_write_guard::start_thread([slot] {
         auto t0 = std::chrono::steady_clock::now();
         std::string why;
         std::shared_ptr<Snapshot> s;

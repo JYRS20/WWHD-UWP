@@ -1,5 +1,6 @@
 // Render-thread profiler (render_prof.h).
 #include "render_prof.h"
+#include "profile_sampling.h"
 #include "perf_metrics.h"
 
 #include <algorithm>
@@ -70,7 +71,7 @@ bool g_track_unique = false;
 uint32_t g_reg_dirty = 0;
 
 namespace {
-constexpr uint32_t kSampleMask = 63;  // draws and register writes: one call in 64 is timed
+constexpr uint32_t kSamplePeriod = OperationSampler::kPeriod;
 struct Window {
     uint64_t frames = 0, holdFrames = 0;
     uint64_t opCount[kOps]{}, opTimed[kOps]{}, opNs[kOps]{};
@@ -86,7 +87,7 @@ uint64_t frameUpload[kUploadKinds]{};
 std::array<std::vector<std::pair<uint64_t, uint64_t>>, kUploadKinds> reads;
 std::vector<uint32_t> otherRegs(0x10000);  // changed-value writes of non-buffer registers, this window
 uint64_t windowStart = 0, cpuStart = 0, frameCounter = 0, stepsStart = 0;
-uint32_t sampleCounter[kOps]{};
+OperationSampler drawSampler{0x9e3779b9u}, registerSampler{0x85ebca6bu};
 
 struct ShaderStats {
     uint64_t variants = 0, newPrograms = 0, unusedOnly = 0;
@@ -108,7 +109,7 @@ void mark_slow(Phase p) {
 uint64_t op_begin(Op op) {
     if (!enabled()) return 0;
     W.opCount[op]++;
-    if ((op == kOpDraw || op == kOpRegs) && (++sampleCounter[op] & kSampleMask)) {
+    if ((op == kOpDraw || op == kOpRegs) && !(op == kOpDraw ? drawSampler : registerSampler).take()) {
         if (op == kOpDraw) g_draw_sampled = false;  // also after a sampled draw that threw
         return 0;
     }
@@ -282,6 +283,9 @@ void frame_end(bool hold) {
         ops += line;
     }
     add("[prof] ops ms/frame:%s", ops.c_str());
+    add("[prof sampling] draws %llu/%llu; registers %llu/%llu; stratified positions, independent deterministic streams; phase timings are wall-time estimates, not exclusive CPU time",
+        (unsigned long long)W.opTimed[kOpDraw], (unsigned long long)W.opCount[kOpDraw],
+        (unsigned long long)W.opTimed[kOpRegs], (unsigned long long)W.opCount[kOpRegs]);
     if (W.opTimed[kOpDraw]) {
         static const char* phaseNames[kDrawPhases] = {"shader", "indices", "targets", "pipeline", "uniforms", "textures",
                                                       "descriptors", "pass", "record", "vertex", "submit"};
@@ -293,7 +297,7 @@ void frame_end(bool hold) {
             ph += line;
             sum += W.phaseNs[p] * scale;
         }
-        add("[prof] draw phases ms/frame (1 draw in %u sampled):%s; untracked %.2f; %.2f us/draw", kSampleMask + 1,
+        add("[prof] draw phases ms/frame (one varied-position sample per %u draws; estimated):%s; untracked %.2f; %.2f us/draw", kSamplePeriod,
             ph.c_str(), std::max(0.0, opMs(kOpDraw) - sum), opMs(kOpDraw) * 1e3 * frames / std::max<uint64_t>(1, W.opCount[kOpDraw]));
     }
     static const char* syncNames[kSyncs] = {"DrawDone", "CopySurface", "flip", "other"};

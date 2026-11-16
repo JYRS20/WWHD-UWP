@@ -1,0 +1,100 @@
+{
+  "format_version": 1,
+  "id": "gc-minimap",
+  "name": "GameCube minimap",
+  "version": "0.3.0",
+  "game_id": "wwhd",
+  "kind": "guest",
+  "guest": {
+    "api_version": 1,
+    "elf": "mod.elf"
+  },
+  "options": [
+    {
+      "id": "x",
+      "name": "Left margin (720p pixels)",
+      "type": "number",
+      "default": 6,
+      "min": 0,
+      "max": 1200,
+      "step": 1
+    },
+    {
+      "id": "y",
+      "name": "Bottom margin (720p pixels)",
+      "type": "number",
+      "default": 18,
+      "min": 0,
+      "max": 650,
+      "step": 1
+    },
+    {
+      "id": "size",
+      "name": "Panel size (720p pixels)",
+      "type": "number",
+      "default": 225,
+      "min": 64,
+      "max": 600,
+      "step": 1
+    },
+    {
+      "id": "opacity",
+      "name": "Panel opacity",
+      "type": "number",
+      "default": 0.8,
+      "min": 0,
+      "max": 1,
+      "step": 0.05
+    },
+    {
+      "id": "style",
+      "name": "Map style",
+      "type": "enum",
+      "default": "vector",
+      "choices": [
+        "vector",
+        "original"
+      ]
+    },
+    {
+      "id": "dungeons",
+      "name": "Show dungeon maps",
+      "type": "bool",
+      "default": true
+    }
+  ],
+  "author": "ZeldaWWHDRecomp contributors",
+  "description": "GameCube-style sea and current-room dungeon maps, prepared locally from your own game files.",
+  "minimum_manager_version": "1.5.0",
+  "setup": [
+    {
+      "id": "gc-source",
+      "type": "game_path",
+      "title": "Select your GameCube Wind Waker disc or extracted game folder",
+      "game": "gc_wind_waker",
+      "explanation": "USA, European and Japanese GameCube dumps are supported. Your files stay on this machine."
+    },
+    {
+      "id": "maps",
+      "type": "run_tool",
+      "title": "Prepare local maps",
+      "tool": "tools/prepare.py",
+      "arguments": [
+        "--source",
+        "{game:gc_wind_waker}",
+        "--data",
+        "{data}"
+      ],
+      "outputs": [
+        "maps-ready.json",
+        "dungeons-ready.bin"
+      ],
+      "explanation": "Reads your own game files and writes derived map images only to this mod\u2019s data folder."
+    },
+    {
+      "id": "build",
+      "type": "build_guest_mod",
+      "title": "Build minimap for this installation"
+    }
+  ]
+}

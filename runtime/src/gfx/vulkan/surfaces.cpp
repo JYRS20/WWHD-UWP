@@ -17,6 +17,7 @@
 #include "shaders.h"
 #include "sparse_hash_memo.h"
 #include "write_watch.h"
+#include "uwp_texture_watch.h"
 #define XXH_INLINE_ALL
 #include "../../../third_party/xxhash/xxhash.h"
 #include "Cafe/HW/Latte/ISA/LatteReg.h"
@@ -25,6 +26,7 @@
 #include "gx2/gx2.h"
 #include "gx2_texture_regs.h"
 #include "runtime.h"
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -300,7 +302,9 @@ Surface* surface_from_depth_buffer(uint32_t addr, uint32_t* firstSlice, uint32_t
 // ---------------------------------------------------------------- sampled textures
 static uint64_t sparse_hash(Surface* s);
 uint64_t g_stat_full_checks, g_stat_uploads, g_stat_invalidates, g_stat_invalidated_surfaces;
+uint64_t g_surface_epoch = 1; // Invalidate continued draws when surfaces or contents change.
 uint64_t g_stat_texture_check_ns, g_stat_texture_check_bytes, g_stat_texture_upload_ns;
+uint64_t g_stat_native_watch_ns=0,g_stat_native_watch_checks=0,g_stat_native_watch_skips=0,g_stat_native_watch_verified=0;
 static bool texture_work_stats() {
     static const bool on=[] {
         const char* cpu=getenv("WWHD_VK_CPU_ONLY_STATS");
@@ -418,6 +422,7 @@ Surface* sampled_texture(const uint32_t* w, bool isDepthSampler) {
     memcpy(&w4, &w[4], 4);
     memcpy(&w5, &w[5], 4);
     uint32_t addr = w[2] << 8, mipAddr = w[3] << 8;
+
     if (!addr) return nullptr;
     auto dim = w0.get_DIM();
     uint32_t pitch = (w0.get_PITCH() + 1) << 3;
@@ -708,6 +713,7 @@ void destroy_surface_image(Surface* s) {
     if (!s) return;
     if (s->mipChain) { destroy_surface_image(s->mipChain.get()); s->mipChain.reset(); }
     if(!s->image)return;
+    ++g_surface_epoch;
     auto views=std::move(s->layerViews);if(s->view)views.push_back(s->view);
     for(auto& [key,view]:s->sampledViews)if(view)views.push_back(view);s->sampledViews.clear();
     defer_surface_image(s->image,s->memory,std::move(views));
@@ -1133,7 +1139,7 @@ Surface* find_or_create_surface(const SurfaceDesc& d,bool forRendering) {
     s->format=d.format;s->dim=d.dim;s->tileMode=d.tileMode;s->swizzle=d.swizzle;s->isDepth=d.isDepth;
     s->fmt=d.isDepth&&!forRendering?comparison_format_info(d.format):format_info(d.format,d.isDepth);
     create_surface_image(s.get(),forRendering);
-    auto* raw=s.get();cache.emplace(d.addr,std::move(s));
+    auto* raw=s.get();cache.emplace(d.addr,std::move(s));++g_surface_epoch;
     // format views of one guest surface (adopt_newer_alias): flag them once, so lookups stay cheap
     if(!raw->isDepth&&!raw->fmt.compressed&&raw->fmt.convert==Convert::NONE) {
         auto views=cache.equal_range(d.addr);
@@ -1180,6 +1186,17 @@ void upload_surface(Surface* s) {
     }
     s->dataSize=ranges[0].second;
     bool full = s->dirty || !s->watched;
+    bool verifyNativeClean=false;
+    if(uwp_texture_watch::active() && !wwatch::active()) {
+        const bool timed=texture_work_stats();const uint64_t started=timed?rprof::now_ns():0;
+        const bool changed=uwp_texture_watch::changed(ranges.data(),levels,s->watchStamp);
+        if(timed){g_stat_native_watch_ns+=rprof::now_ns()-started;++g_stat_native_watch_checks;}
+        if(!full && !changed) {
+            ++g_stat_native_watch_skips;
+            if(!uwp_texture_watch::verify())return;
+            verifyNativeClean=true; // full original check below, never skip in verify
+        }
+    }
     if (wwatch::active()) {
         for(uint32_t level=0;level<levels&&!full;++level)full=wwatch::written_since(ranges[level].first,ranges[level].second,s->watchStamp);
         if (!full) return;
@@ -1210,11 +1227,22 @@ void upload_surface(Surface* s) {
         if(timed)g_stat_texture_check_bytes+=ranges[level].second;
     }
     if(timed)g_stat_texture_check_ns+=rprof::now_ns()-hashStarted;
+    if(verifyNativeClean && !s->dirty) {
+        // Live guest data may change during the hash. Only compare a clean
+        // interval; an intervening write is retained and handled next check.
+        uint64_t verifyStamp=s->watchStamp;
+        const bool intervening=uwp_texture_watch::changed(ranges.data(),levels,verifyStamp);
+        if(!intervening) {
+            if(hash!=s->contentHash)exception_report::raise("native texture watch missed a content change");
+            ++g_stat_native_watch_verified;
+        }
+    }
     if(!s->dirty&&hash==s->contentHash)return;
     const uint64_t uploadStarted=timed?rprof::now_ns():0;
     end_encoder();transition_image(s,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_WRITE_BIT);
     for(uint32_t level=0;level<s->mips;++level) {
         std::vector<uint8_t> data;uint32_t w,h,slices;decode_level(s,level,mip_base(s,level),data,w,h,slices);
+
         if (s->bcDecoded) { bc_decode_upload(s,level,data,w,h,slices); continue; }
         std::vector<VkBufferImageCopy> copies;std::vector<uint8_t> packed;
         bool threeD=s->imageType==VK_IMAGE_TYPE_3D;
@@ -1238,7 +1266,7 @@ void upload_surface(Surface* s) {
         defer_buffer(staging);
     }
     transition_image(s,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    s->contentHash=hash;s->writeSeq=next_write_seq();s->dirty=false;++g_stat_uploads;
+    s->contentHash=hash;s->writeSeq=next_write_seq();s->dirty=false;++g_stat_uploads;++g_surface_epoch;
     if(timed)g_stat_texture_upload_ns+=rprof::now_ns()-uploadStarted;
 }
 void clear_color(const uint32_t*,uint32_t cb,const float rgba[4]) {
@@ -1448,6 +1476,7 @@ void copy_surface_impl(uint32_t srcAddr,uint32_t srcMip,uint32_t srcSlice,uint32
         memcpy(mem::ptr(dbase+offset),rows.data()+(size_t(y)*bw+x)*sf.bytesPerBlock,sf.bytesPerBlock);
     }
     for(auto& [address,image]:stereo_copy_cache(dbase,dw,dh,d->depth))if(address==dbase){image->gpuWritten=false;image->dirty=true;image->lastCheckedFrame=~0ull;}
+    ++g_surface_epoch;
 }
 void copy_surface(uint32_t src,uint32_t srcMip,uint32_t srcSlice,uint32_t dst,uint32_t dstMip,uint32_t dstSlice) {
     copy_surface_impl(src,srcMip,srcSlice,dst,dstMip,dstSlice);
@@ -1503,6 +1532,7 @@ void invalidate_surface_cache(decltype(Renderer::surfaces)& surfaces,
 }
 void ss_reset_surfaces() {
     R.mainDepthAddr = 0;
+    ++g_surface_epoch;
     reset_ao_private_cache();
     for(auto& [addr,s]:R.surfaces){s->guestLayout.reset();s->dirty=true;s->lastCheckedFrame=~0ull;}
 }

@@ -564,6 +564,52 @@ static void test_steps_on_vsync() {
     CHECK(slot_step_start(1080, 100, 20, 1000, true).how == StepStart::kLate && slot_step_start(1080, 100, 20, 1000, true).start == 1080);
 }
 
+// The game decides whether to draw a hold before the asynchronous renderer has
+// finished its frame. Reproduce that order, rather than making rendering part of
+// the decision's elapsed time. Costs in ns; one render job must finish before the
+// next pass can start (the flip fence).
+static void test_async_60_clock() {
+    constexpr int64_t ms = 1'000'000, step = 33'366'666, budget = step + 2 * ms;
+    auto run = [&](bool corrected, int64_t renderCost) {
+        int64_t t = 0, last = 0, holdAvg = 16 * ms;
+        int steps = 0, holds = 0;
+        bool wait = false;
+        while (t < 60'000 * ms) {
+            const auto plan = wall_step_start(t, last, step, wait, steps != 0);
+            if (plan.how == StepStart::kWait) t = plan.start;
+            last = corrected || plan.how == StepStart::kWait ? plan.start : t;
+            ++steps;
+            const int64_t decision = t + 8 * ms; // game work; renderer still running
+            const bool hold = next_pass(0, 1, decision - last, holdAvg, budget) == Next::kHold;
+            t += std::max<int64_t>(16'683'333, renderCost);
+            if (hold) {
+                const int64_t duration = std::max<int64_t>(16'683'333, renderCost);
+                t += duration;
+                holdAvg = update_average(holdAvg, duration);
+                ++holds;
+            }
+            wait = corrected || !hold;
+        }
+        const double seconds = t / 1e9;
+        return SimResult{steps / seconds, (steps + holds) / seconds, double(holds) / steps, 0, 0};
+    };
+    for (int64_t cost : {16 * ms, 22 * ms, 26 * ms, 32 * ms}) {
+        const auto old = run(false, cost), fixed = run(true, cost);
+        std::printf("async 60, render %.1f ms: original %.3f logic/s, corrected %.3f logic/s, %.1f frames/s\n",
+                    cost / 1e6, old.steps_per_s, fixed.steps_per_s, fixed.frames_per_s);
+        CHECK_NEAR(fixed.steps_per_s, 29.97, 0.08);
+        if (cost == 16 * ms) CHECK_NEAR(fixed.frames_per_s, 59.94, 0.1);
+        if (cost == 22 * ms || cost == 26 * ms) CHECK(old.steps_per_s < 24);
+        CHECK(fixed.frames_per_s <= 60.1);
+    }
+    // An early wake waits; a modest overrun is retained; a long loading stall
+    // starts a fresh schedule rather than replaying missed game steps.
+    CHECK(wall_step_start(100, 90, 20, true, true).how == StepStart::kWait);
+    CHECK(wall_step_start(115, 90, 20, true, true).start == 110);
+    CHECK(wall_step_start(150, 90, 20, true, true).start == 150);
+    CHECK(wall_step_start(100, 90, 20, false, true).start == 100);
+}
+
 int main() {
     test_fractions();
     test_blends();
@@ -572,6 +618,7 @@ int main() {
     test_plan_and_next();
     test_simulation();
     test_steps_on_vsync();
+    test_async_60_clock();
     if (g_failed) {
         std::fprintf(stderr, "interp_pacing_test: %d check(s) failed\n", g_failed);
         return 1;

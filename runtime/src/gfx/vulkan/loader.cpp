@@ -1,6 +1,7 @@
 // Vulkan entry points loaded at run time (loader.h).
 #include "../../exception_report.h"
 #include "loader.h"
+#include "command_trace.h"
 #include <stdexcept>
 #include <string>
 
@@ -50,7 +51,7 @@ void load_device_functions(VkDevice device, bool khrDynamicRendering, bool rende
   if (!(name = reinterpret_cast<PFN_##name>(vkGetDeviceProcAddr(device, #name)))) missing(#name);
   WWHD_VK_DEVICE_FUNCTIONS(WWHD_VK_LOAD)
 #undef WWHD_VK_LOAD
-  if (renderPasses) { vkCmdBeginRendering=nullptr; vkCmdEndRendering=nullptr; return; }
+  if (renderPasses) { vkCmdBeginRendering=nullptr; vkCmdEndRendering=nullptr; install_command_trace(); return; }
   // the core 1.3 function or the extension's: same parameters (VkRenderingInfoKHR = VkRenderingInfo)
 #define WWHD_VK_LOAD(name)                                                                          \
   {                                                                                                 \
@@ -59,5 +60,6 @@ void load_device_functions(VkDevice device, bool khrDynamicRendering, bool rende
   }
   WWHD_VK_RENDERING_FUNCTIONS(WWHD_VK_LOAD)
 #undef WWHD_VK_LOAD
+  install_command_trace();
 }
 }  // namespace gfxvk

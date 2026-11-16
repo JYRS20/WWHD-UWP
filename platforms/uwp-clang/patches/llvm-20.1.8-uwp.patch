@@ -2,32 +2,32 @@
 +++ b/clang/CMakeLists.txt
 @@ -498,7 +498,9 @@
  add_subdirectory(runtime)
-
+ 
  option(CLANG_BUILD_EXAMPLES "Build CLANG example programs by default." OFF)
 -add_subdirectory(examples)
 +if(CLANG_BUILD_EXAMPLES)
 +  add_subdirectory(examples)
 +endif()
-
+ 
  if(APPLE)
    # this line is needed as a cleanup to ensure that any CMakeCaches with the old
 --- a/clang/lib/Driver/ToolChains/MSVC.cpp
 +++ b/clang/lib/Driver/ToolChains/MSVC.cpp
 @@ -602,7 +602,7 @@
-
+ 
  static VersionTuple getMSVCVersionFromExe(const std::string &BinDir) {
    VersionTuple Version;
 -#ifdef _WIN32
 +#if defined(_WIN32) && WINAPI_FAMILY != WINAPI_FAMILY_APP
    SmallString<128> ClExe(BinDir);
    llvm::sys::path::append(ClExe, "cl.exe");
-
+ 
 --- a/llvm/include/llvm/Support/Windows/WindowsSupport.h
 +++ b/llvm/include/llvm/Support/Windows/WindowsSupport.h
 @@ -24,8 +24,14 @@
  // mingw-w64 tends to define it as 0x0502 in its headers.
  #undef _WIN32_WINNT
-
+ 
 -// Require at least Windows 7 API.
 +#include <winapifamily.h>
 +#if WINAPI_FAMILY == WINAPI_FAMILY_APP
@@ -81,7 +81,7 @@
 --- a/llvm/lib/Support/raw_socket_stream.cpp
 +++ b/llvm/lib/Support/raw_socket_stream.cpp
 @@ -109,6 +109,12 @@
-
+ 
  Expected<ListeningSocket> ListeningSocket::createUnix(StringRef SocketPath,
                                                        int MaxBacklog) {
 +#if defined(_WIN32) && WINAPI_FAMILY == WINAPI_FAMILY_APP
@@ -90,7 +90,7 @@
 +                                      "Local compiler server sockets are unavailable in UWP");
 +#else
 +
-
+ 
    // Handle instances where the target socket address already exists and
    // differentiate between a preexisting file with and without a bound socket
 @@ -175,6 +181,7 @@
@@ -99,14 +99,14 @@
  #endif // _WIN32
 +#endif
  }
-
+ 
  // If a file descriptor being monitored by ::poll is closed by another thread,
 --- a/llvm/lib/Support/Windows/DynamicLibrary.inc
 +++ b/llvm/lib/Support/Windows/DynamicLibrary.inc
 @@ -44,7 +44,11 @@
      return &DynamicLibrary::Invalid;
    }
-
+ 
 +#if WINAPI_FAMILY == WINAPI_FAMILY_APP
 +  HMODULE Handle = LoadPackagedLibrary(FileUnicode.data(), 0);
 +#else
@@ -117,7 +117,7 @@
      return &DynamicLibrary::Invalid;
 @@ -66,6 +70,12 @@
  }
-
+ 
  static bool GetProcessModules(HANDLE H, DWORD &Bytes, HMODULE *Data = nullptr) {
 +#if WINAPI_FAMILY == WINAPI_FAMILY_APP
 +  (void)H; (void)Data; Bytes = 0;
@@ -134,7 +134,7 @@
    return true;
 +#endif
  }
-
+ 
  void *DynamicLibrary::HandleSet::DLSym(void *Handle, const char *Symbol) {
 --- a/llvm/lib/Support/Windows/Memory.inc
 +++ b/llvm/lib/Support/Windows/Memory.inc
@@ -155,11 +155,11 @@
    return 0;
 +#endif
  }
-
+ 
  namespace llvm {
 @@ -130,8 +135,11 @@
    DWORD Protect = getWindowsProtectionFlags(Flags);
-
+ 
    size_t AllocSize = NumBlocks * Granularity;
 -  void *PA = ::VirtualAlloc(reinterpret_cast<void *>(Start), AllocSize,
 -                            AllocType, Protect);
@@ -173,7 +173,7 @@
        // Try again without the NearBlock hint and without large memory pages
 @@ -173,7 +181,11 @@
    DWORD Protect = getWindowsProtectionFlags(Flags);
-
+ 
    DWORD OldFlags;
 +#if WINAPI_FAMILY == WINAPI_FAMILY_APP
 +  if (!VirtualProtectFromApp(M.Address, M.AllocatedSize, Protect, &OldFlags))
@@ -181,14 +181,14 @@
    if (!VirtualProtect(M.Address, M.AllocatedSize, Protect, &OldFlags))
 +#endif
      return mapWindowsError(::GetLastError());
-
+ 
    if (Flags & MF_EXEC)
 --- a/llvm/lib/Support/Windows/Path.inc
 +++ b/llvm/lib/Support/Windows/Path.inc
 @@ -41,6 +41,22 @@
  #pragma comment(lib, "ole32.lib")    // This provides CoTaskMemFree
  #endif
-
+ 
 +#if WINAPI_FAMILY == WINAPI_FAMILY_APP
 +static HANDLE LLVMUwpCreateFileW(LPCWSTR Path, DWORD Access, DWORD Share,
 +    LPSECURITY_ATTRIBUTES Security, DWORD Creation, DWORD Flags, HANDLE Template) {
@@ -206,7 +206,7 @@
 +#endif
 +
  using namespace llvm;
-
+ 
  using llvm::sys::windows::CurCPToUTF16;
 @@ -289,7 +305,7 @@
    // file to be deleted once it is closed. We also use the flags
@@ -246,7 +246,7 @@
      if (FromHandle)
 @@ -795,7 +811,7 @@
    }
-
+ 
    ScopedFileHandle h(
 -      ::CreateFileW(path_utf16.begin(), 0, // Attributes only.
 +      ::LLVM_UWP_CREATE_FILE_W(path_utf16.begin(), 0, // Attributes only.
@@ -255,7 +255,7 @@
    if (!h)
 @@ -1193,7 +1209,7 @@
    SA.bInheritHandle = Inherit;
-
+ 
    HANDLE H =
 -      ::CreateFileW(PathUTF16.begin(), Access,
 +      ::LLVM_UWP_CREATE_FILE_W(PathUTF16.begin(), Access,
@@ -264,7 +264,7 @@
    if (H == INVALID_HANDLE_VALUE) {
 @@ -1373,6 +1389,11 @@
  }
-
+ 
  std::error_code remove_directories(const Twine &path, bool IgnoreErrors) {
 +#if WINAPI_FAMILY == WINAPI_FAMILY_APP
 +  (void)path; (void)IgnoreErrors;
@@ -280,11 +280,11 @@
    return std::error_code();
 +#endif
  }
-
+ 
  static void expandTildeExpr(SmallVectorImpl<char> &Path) {
 @@ -1486,6 +1508,12 @@
  } // end namespace fs
-
+ 
  namespace path {
 +#if WINAPI_FAMILY == WINAPI_FAMILY_APP
 +// The embedded compiler gets all roots explicitly through its in-memory VFS.
@@ -301,7 +301,7 @@
  }
 +
 +#endif
-
+ 
  static bool getTempDirEnvVar(const wchar_t *Var, SmallVectorImpl<char> &Res) {
    SmallVector<wchar_t, 1024> Buf;
 --- a/llvm/lib/Support/Windows/Process.inc
@@ -313,7 +313,7 @@
  // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 @@ -69,6 +70,10 @@
  }
-
+ 
  size_t Process::GetMallocUsage() {
 +#if WINAPI_FAMILY == WINAPI_FAMILY_APP
 +  return 0; // Heap enumeration is unavailable in AppContainer.
@@ -321,14 +321,14 @@
 +
    _HEAPINFO hinfo;
    hinfo._pentry = NULL;
-
+ 
 @@ -78,6 +83,7 @@
      size += hinfo._size;
-
+ 
    return size;
 +#endif
  }
-
+ 
  void Process::GetTimeUsage(TimePoint<> &elapsed,
 @@ -109,8 +115,9 @@
    //
@@ -339,12 +339,12 @@
 +#if WINAPI_FAMILY != WINAPI_FAMILY_APP
 +  SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
 +#endif
-
+ 
    coreFilesPrevented = true;
  }
 @@ -459,6 +466,12 @@
  }
-
+ 
  unsigned Process::GetRandomNumber() {
 +#if WINAPI_FAMILY == WINAPI_FAMILY_APP
 +  unsigned Value;
@@ -356,17 +356,17 @@
    HCRYPTPROV HCPC;
    if (::CryptAcquireContextW(&HCPC, NULL, NULL, PROV_RSA_FULL,
 @@ -472,6 +485,7 @@
-
+ 
    // If that fails, fall back to pseudo-random numbers.
    return GetPseudoRandomNumber();
 +#endif
  }
-
+ 
  typedef NTSTATUS(WINAPI *RtlGetVersionPtr)(PRTL_OSVERSIONINFOW);
 --- a/llvm/lib/Support/Windows/Program.inc
 +++ b/llvm/lib/Support/Windows/Program.inc
 @@ -37,6 +37,10 @@
-
+ 
  ErrorOr<std::string> sys::findProgramByName(StringRef Name,
                                              ArrayRef<StringRef> Paths) {
 +#if WINAPI_FAMILY == WINAPI_FAMILY_APP
@@ -374,18 +374,18 @@
 +#else
 +
    assert(!Name.empty() && "Must have a name!");
-
+ 
    if (Name.find_first_of("/\\") != StringRef::npos)
 @@ -106,6 +110,7 @@
-
+ 
    llvm::sys::path::make_preferred(U8Result);
    return std::string(U8Result.begin(), U8Result.end());
 +#endif
  }
-
+ 
  bool MakeErrMsg(std::string *ErrMsg, const std::string &prefix) {
 @@ -129,6 +134,10 @@
-
+ 
  static HANDLE RedirectIO(std::optional<StringRef> Path, int fd,
                           std::string *ErrMsg) {
 +#if WINAPI_FAMILY == WINAPI_FAMILY_APP
@@ -397,11 +397,11 @@
      if (!DuplicateHandle(GetCurrentProcess(), (HANDLE)_get_osfhandle(fd),
 @@ -167,6 +176,7 @@
    }
-
+ 
    return h;
 +#endif
  }
-
+ 
  } // namespace llvm
 @@ -177,6 +187,10 @@
                      ArrayRef<std::optional<StringRef>> Redirects,
@@ -416,11 +416,11 @@
        *ErrMsg = "program not executable";
 @@ -348,6 +362,7 @@
    }
-
+ 
    return true;
 +#endif
  }
-
+ 
  static bool argNeedsQuotes(StringRef Arg) {
 --- a/llvm/lib/Support/Signals.cpp
 +++ b/llvm/lib/Support/Signals.cpp
@@ -439,7 +439,7 @@
 +++ b/llvm/lib/Support/Windows/Threading.inc
 @@ -161,6 +161,12 @@
  }
-
+ 
  static std::optional<std::vector<USHORT>> getActiveGroups() {
 +#if WINAPI_FAMILY == WINAPI_FAMILY_APP
 +  GROUP_AFFINITY Affinity{};
@@ -452,11 +452,11 @@
      return std::nullopt;
 @@ -174,6 +180,7 @@
      return std::nullopt;
-
+ 
    return Groups;
 +#endif
  }
-
+ 
  static ArrayRef<ProcessorGroup> getProcessorGroups() {
 --- a/llvm/lib/Support/ErrorHandling.cpp
 +++ b/llvm/lib/Support/ErrorHandling.cpp
@@ -474,19 +474,19 @@
 +#endif
    return mapWindowsError(EV);
  }
-
+ 
 --- a/llvm/lib/WindowsDriver/MSVCPaths.cpp
 +++ b/llvm/lib/WindowsDriver/MSVCPaths.cpp
 @@ -35,8 +35,8 @@
  #include <windows.h>
  #endif
-
+ 
 -#ifdef _MSC_VER
 -// Don't support SetupApi on MinGW.
 +#if defined(_MSC_VER) && WINAPI_FAMILY != WINAPI_FAMILY_APP
 +// SetupApi/COM discovery is desktop-only; embedded UWP uses explicit inputs.
  #define USE_MSVC_SETUP_API
-
+ 
  // Make sure this comes before MSVCSetupApi.h
 @@ -174,7 +174,7 @@
  /// characters are compared.  This function only searches HKLM.

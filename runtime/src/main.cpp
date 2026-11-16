@@ -1,3 +1,4 @@
+#include "platform/uwp_write_guard.h"
 // Wind Waker HD recompiled: entry point.
 #ifndef _WIN32
 #include <dlfcn.h>
@@ -629,7 +630,7 @@ int main(int argc, char** argv) {
     }
     static LoadedModule mod = m;
     static uint32_t args = argv_arr;
-    std::thread([] {
+    uwp_write_guard::start_thread([] {
         threads::run_main(mod, 1, args);
         LOG("[boot] game main thread returned");
         std::exit(0);

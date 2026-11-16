@@ -1,3 +1,4 @@
+#include "platform/uwp_write_guard.h"
 // Decomp build: the environment the decompiled source is written against (gabi.h in the decompilation,
 // decomp/tools/verify/include) on the running game, and the per-function slots (decomp.h).
 //
@@ -233,7 +234,7 @@ void init() {
         g_ncand.reset(new std::atomic<uint64_t>[kNumSlots]());
         g_norig.reset(new std::atomic<uint64_t>[kNumSlots]());
         static std::string path = p;
-        std::thread([] {
+        uwp_write_guard::start_thread([] {
             for (;;) {
                 std::this_thread::sleep_for(std::chrono::seconds(2));
                 write_stats(path);

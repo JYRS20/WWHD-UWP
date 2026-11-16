@@ -1,0 +1,102 @@
+/* SPDX-License-Identifier: MPL-2.0
+ * UWP presentation adjustments. These touch only this mod's private HUD objects.
+ * No game progression, inventory, camera or save data is changed.
+ */
+#define HD_MAP_STATE @MAP@
+#define HD_DUNGEON_STATE @DUNGEON@
+#define HD_VIEW_STATE @VIEW@
+#define HD_FAMILY_STATE @FAMILY@
+
+static void hd_restore_island_fit(void) {
+    uint32_t owner=ld32(HD_VIEW_STATE+8), current=ld32(HD_MAP_STATE+4);
+    if(owner && owner==current) {
+        const uint32_t expected[3]={ld32(current+0x94),ld32(current+0xB8),ld32(current+0x98)};
+        for(unsigned i=0;i<3;++i) {
+            const uint32_t slot=HD_VIEW_STATE+0x10+i*0x14,pane=ld32(slot);
+            if(pane && pane==expected[i]) {
+                st32(pane+0x34,ld32(slot+4));st32(pane+0x38,ld32(slot+8));
+                st32(pane+0x1C,ld32(slot+12));st32(pane+0x20,ld32(slot+16));
+                st8(pane+0x44,ld8(pane+0x44)|0x10);
+            }
+        }
+    }
+    st32(HD_VIEW_STATE+8,0);
+}
+static void hd_fit_sailing_island(void) {
+    if(!ld32(HD_VIEW_STATE+4)||!ld32(HD_MAP_STATE+0x7C))return;
+    uint32_t owner=ld32(HD_MAP_STATE+4);if(!owner)return;
+    uint32_t big=ld32(owner+0x94);if(!big)return;
+    // P_DummyMapBig_00 is the island artwork. Link and ship are siblings of
+    // N_MapBig, so their positions must receive the SAME affine transform.
+    uint32_t count=ld32(big+0x10),picture=ld32(big+0x14);
+    if(count>64)return;
+    for(unsigned i=0;i<count;++i,picture=ld32(picture)) {
+        if(ld32(picture+0x80)==0x505F4475u && ld32(picture+0x84)==0x6D6D794Du &&
+           ld32(picture+0x88)==0x61704269u && ld32(picture+0x8C)==0x675F3030u)break;
+        if(i+1==count)return;
+    }
+    if(!count||!picture)return;
+    const float w=fabsf((float)(ldf32(picture+0x3C)*ldf32(picture+0x34)));
+    const float h=fabsf((float)(ldf32(picture+0x40)*ldf32(picture+0x38)));
+    if(!(w>0&&h>0&&w<10000&&h<10000))return;
+    const float fit=fminf(1.f,185.4f/fmaxf(w,h)); // 206-unit square, 5% padding per side
+    const float sx=ldf32(big+0x34),sy=ldf32(big+0x38);
+    const float ox=ldf32(big+0x1C),oy=ldf32(big+0x20);
+    const float nx=-ldf32(picture+0x1C)*sx*fit,ny=-ldf32(picture+0x20)*sy*fit;
+    const uint32_t panes[3]={big,ld32(owner+0xB8),ld32(owner+0x98)};
+    st32(HD_VIEW_STATE+8,owner);
+    for(unsigned i=0;i<3;++i) {
+        uint32_t slot=HD_VIEW_STATE+0x10+i*0x14,pane=panes[i];st32(slot,pane);if(!pane)continue;
+        st32(slot+4,ld32(pane+0x34));st32(slot+8,ld32(pane+0x38));
+        st32(slot+12,ld32(pane+0x1C));st32(slot+16,ld32(pane+0x20));
+        stf32(pane+0x34,ldf32(pane+0x34)*fit);stf32(pane+0x38,ldf32(pane+0x38)*fit);
+        stf32(pane+0x1C,i?(ldf32(pane+0x1C)-ox)*fit+nx:nx);
+        stf32(pane+0x20,i?(ldf32(pane+0x20)-oy)*fit+ny:ny);
+        st8(pane+0x44,ld8(pane+0x44)|0x10);
+    }
+}
+static void hd_clip_dungeon(Cpu* c) {
+    const uint32_t owned=ld32(HD_DUNGEON_STATE+4);
+    const float side=ldf32(HD_DUNGEON_STATE+0x34);
+    const float x=ldf32(HD_DUNGEON_STATE+0xA0),y=ldf32(HD_DUNGEON_STATE+0xA4);
+    if(owned && owned==c->r[3] && side>0 && side<=600 && isfinite(x)&&isfinite(y)) {
+        const uint32_t rect=owned+0x3B8;
+        // Native Rect is bottom-left min/max. The native draw converts it to
+        // GPU top-left coordinates. Keep it in logical TV pixels, not 1080p.
+        float left=ceilf(fmaxf(0,640.f+x-side*.5f)),bottom=ceilf(fmaxf(0,360.f+y-side*.5f));
+        float right=floorf(fminf(1280,640.f+x+side*.5f)),top=floorf(fminf(720,360.f+y+side*.5f));
+        if(right<=left||top<=bottom)return;
+        stf32(rect,left);stf32(rect+4,bottom);stf32(rect+8,right);stf32(rect+12,top);
+    }
+    c->pc=0x0265C790u;ppc_dispatch(c);
+}
+static void hd_live_wind_heading(Cpu* c) {
+    // Query the current world vector every tick, independently of the Maps
+    // tab. The artwork points up; pane rotations are counter-clockwise in XY.
+    g_host->call_original(c,0x0257DAA8u);
+    uint32_t vector=c->r[3];
+    if(vector) {
+        float x=ldf32(vector),z=ldf32(vector+8);
+        if(isfinite(x)&&isfinite(z)&&x*x+z*z>1e-12f) {
+            float angle=atan2f(-x,-z)*10430.37835047045f;
+            c->r[3]=(uint16_t)(int32_t)lrintf(angle);return;
+        }
+    }
+    g_host->call_original(c,0x0257DACCu);
+}
+void hd_minimap_set_view(float compact,int fit) {
+    if(!(compact>=120&&compact<=240))compact=160;
+    float large=compact*1.5f;
+    stf32(HD_VIEW_STATE,compact);st32(HD_VIEW_STATE+4,fit!=0);
+    stf32(HD_MAP_STATE+0x20,-616.f+compact*.5f);stf32(HD_MAP_STATE+0x24,-336.f+compact*.5f);
+    stf32(HD_MAP_STATE+0x30,-616.f+large*.5f);stf32(HD_MAP_STATE+0x34,-336.f+large*.5f);
+    stf32(HD_MAP_STATE+0x80,compact/206.f);stf32(HD_MAP_STATE+0x38,large/(206.f*2.2f));
+    stf32(HD_MAP_STATE+0x70,-compact-49.f);stf32(HD_MAP_STATE+0x74,-large-43.72f);
+    stf32(HD_DUNGEON_STATE+0x34,compact);stf32(HD_DUNGEON_STATE+0x38,compact);
+    stf32(HD_DUNGEON_STATE+0x50,compact);stf32(HD_DUNGEON_STATE+0x54,large);stf32(HD_DUNGEON_STATE+0x8C,compact);
+    stf32(HD_FAMILY_STATE+0x1C,compact);stf32(HD_FAMILY_STATE+0x20,compact);
+}
+#undef HD_MAP_STATE
+#undef HD_DUNGEON_STATE
+#undef HD_VIEW_STATE
+#undef HD_FAMILY_STATE

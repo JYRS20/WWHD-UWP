@@ -1,3 +1,4 @@
+#include "platform/uwp_write_guard.h"
 #include "../game_clock.h"
 // snd_core (AX): voices, the 3 ms audio frame, mixing and output.
 //
@@ -666,7 +667,7 @@ HLE(snd_core, AXInit) {
     init_buffers();
     audio::init();
     g_running = true;
-    std::thread(frame_thread).detach();
+    uwp_write_guard::start_thread(frame_thread).detach();
     LOG("[ax] initialized, %d voices", kMaxVoices);
 }
 HLE(snd_core, AXQuit) { g_running = false; }

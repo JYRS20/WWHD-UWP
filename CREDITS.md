@@ -12,3 +12,5 @@
 - [JYRS20](https://github.com/JYRS20) — UWP adaptation, integration and Xbox Series S testing.
 
 This unofficial project is not affiliated with Nintendo. Game names and trademarks belong to their respective owners.
+
+- [Chironeyes](https://github.com/Chironeyes/The.Wind.Waker.HD-Minimap.HD) — Minimap HD 1.3, MIT; UWP presentation adaptation and provenance are in `platforms/uwp-game/hd-minimap/`. Native map data is read from the user copy.

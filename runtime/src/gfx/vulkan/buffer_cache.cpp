@@ -83,6 +83,7 @@ State& state() {
   if (State* s = g_state.load(std::memory_order_acquire)) return *s;
   State* created = new State;  // lives as long as the device (never torn down, like the upload arena)
   auto& b = created->backing;
+  if(buffer_cache_exact_raw())b.budget=64ull<<20;
   if (const char* mb = std::getenv("WWHD_VK_BUFFER_CACHE_MB"))
     b.budget = std::max<uint64_t>(std::strtoull(mb, nullptr, 10), 64) << 20;
   VkPhysicalDeviceMemoryProperties p;
@@ -99,7 +100,12 @@ State& state() {
     if (heap < (1ull << 30)) b.budget = std::min<uint64_t>(b.budget, heap / 2);
     break;
   }
-  created->cache.keepShadow = buffer_cache_verify();  // verify() then never reads GPU memory
+  created->cache.keepShadow = buffer_cache_verify() || buffer_cache_exact_raw() || env_is("WWHD_UWP_CACHED_WINDOW_VERIFY","1");
+  if(buffer_cache_exact_raw()) {
+    created->cache.exactRawSource=+[](uint32_t addr,uint32_t)->const uint8_t* {return mem::ptr(addr);};
+    LOG("[vulkan persistent raw] exact full-byte checks; immutable CPU/GPU snapshots; raw vertices/UBO only; indices bypass; %llu MiB GPU budget",
+        (unsigned long long)(b.budget>>20));
+  }
   LOG("[vulkan buffer cache] on%s: budget %llu MiB, %s memory, hints %s", buffer_cache_verify() ? " (verify mode)" : "",
       (unsigned long long)(b.budget >> 20),
       (b.flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) ? "device-local host-visible" : "host-visible",
@@ -119,8 +125,20 @@ State& state() {
 }  // namespace
 
 bool buffer_cache_verify() {
-  static const bool verify = env_is("WWHD_VK_BUFFER_CACHE_VERIFY", "1");
+  static const bool verify = env_is("WWHD_VK_BUFFER_CACHE_VERIFY", "1")
+#ifdef WWHD_UWP
+      || env_is("WWHD_UWP_PERSISTENT_RAW","verify")
+#endif
+      ;
   return verify;
+}
+bool buffer_cache_exact_raw() {
+#ifdef WWHD_UWP
+  static const bool enabled=env_is("WWHD_UWP_PERSISTENT_RAW","optimized") || env_is("WWHD_UWP_PERSISTENT_RAW","verify");
+  return enabled;
+#else
+  return false;
+#endif
 }
 
 // On by default on macOS (verified there: 0 mismatches in verify mode over long gameplay runs), on
@@ -137,6 +155,7 @@ bool buffer_cache_enabled() {
     bool want = kBufferCacheDefault || env_is("WWHD_VK_BUFFER_CACHE", "1") || buffer_cache_verify();
     if (env_is("WWHD_VK_BUFFER_CACHE", "0")) want = false;
     if (!want) return false;
+    if(buffer_cache_exact_raw())return true;
     if (!wwatch::active()) {
       LOG("[vulkan buffer cache] off: page write tracking is unavailable");
       return false;
@@ -148,6 +167,7 @@ bool buffer_cache_enabled() {
 }
 
 bufcache::Cache& buffer_cache() { return state().cache; }
+bool buffer_cache_indices_enabled() {return !buffer_cache_exact_raw() && buffer_cache_enabled();}
 
 UploadSlice buffer_cache_slice(const bufcache::Entry& e, uint64_t size) {
   const auto& b = state().backing.blocks[e.region.block];
@@ -184,6 +204,7 @@ bool cached_guest_range(uint32_t addr, uint32_t size, int uploadKind, UploadSlic
 }
 
 bool cached_native_indices(uint32_t addr, uint32_t size, UploadSlice& out, bufcache::Entry*& entry) {
+  if(buffer_cache_exact_raw())return false;
   if (!addr || !size || size > kMaxCachedRange || uint64_t(addr) + size > 0x100000000ull) return false;
   auto& cache = state().cache;
   bufcache::Entry* e;
@@ -256,6 +277,10 @@ void buffer_cache_report(double frames) {
         (unsigned long long)(c.verifyChecks - o.verifyChecks), (unsigned long long)(c.verifyMismatches - o.verifyMismatches),
         (unsigned long long)(c.verifyRaced - o.verifyRaced), (unsigned long long)c.verifyChecks,
         (unsigned long long)c.verifyMismatches);
+  if(buffer_cache_exact_raw())
+    LOG("[vulkan persistent raw] %.1f full comparisons/frame, %.3f MiB compared/frame; %.1f unsupported index lookups bypassed/frame; GPU regions stay fence-retired",
+        (c.exactChecks-o.exactChecks)/frames,(c.exactBytes-o.exactBytes)/1048576.0/frames,
+        (c.bypassUnsupported-o.bypassUnsupported)/frames);
   o = c;
 }
 

@@ -4,6 +4,7 @@
 // overlapping ranges, converted-data keys, dynamic ranges, deferred region retirement, eviction, the
 // verify mode, and a concurrent writer.
 #include "gfx/vulkan/buffer_cache_core.h"
+#include "platform/uwp_write_guard.h"
 
 #include <atomic>
 #include <chrono>
@@ -102,7 +103,7 @@ static void allocator_tests() {
     printf("allocator: ok\n");
 }
 
-int main() {
+static int run_buffer_tests() {
 #ifdef _WIN32
     g_mem = (uint8_t*)VirtualAlloc(nullptr, kSize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
 #else
@@ -291,7 +292,7 @@ int main() {
     {
         const uint32_t base = 0x1000000, ranges = 64, len = 3000;
         std::atomic<bool> stop{false};
-        std::thread writer([&] {
+        auto writer=uwp_write_guard::start_thread([&] {
             std::mt19937 rng(7);
             while (!stop.load(std::memory_order_relaxed)) {
                 // every other range is written: the rest share pages with written ones or not
@@ -333,4 +334,16 @@ int main() {
     for (auto& al : backing.allocators) assert(al.used() == 0);
     printf("all regions freed: ok\nbuffer cache test passed\n");
     return 0;
+}
+int main(){
+#ifdef WWHD_GUARDED_WRITE_TEST
+    _putenv_s("WWHD_UWP_WRITE_GUARD","optimized");
+    bool propagated=false;
+    try{uwp_write_guard::run([]{throw std::runtime_error("guard test intentional");});}
+    catch(const std::runtime_error&){propagated=true;}
+    assert(propagated && !uwp_write_guard::active());
+#endif
+    int result=0;
+    uwp_write_guard::run([&]{result=run_buffer_tests();});
+    return result;
 }

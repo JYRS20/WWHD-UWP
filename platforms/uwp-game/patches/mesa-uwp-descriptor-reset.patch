@@ -1,0 +1,16 @@
+--- a/src/microsoft/vulkan/dzn_descriptor_set.c
++++ b/src/microsoft/vulkan/dzn_descriptor_set.c
+@@ -1863,7 +1863,12 @@
+ {
+    VK_FROM_HANDLE(dzn_descriptor_pool, pool, descriptorPool);
+ 
+-   for (uint32_t s = 0; s < pool->set_count; s++)
++   /* AllocateDescriptorSets keeps this exclusive upper bound above every
++    * live slot. FreeDescriptorSets recomputes it after finishing freed slots.
++    * Never-used slots have no Vulkan object to finish. Reset still invalidates
++    * every live set; the caller retains the usual external synchronization.
++    */
++   for (uint32_t s = 0; s < pool->used_set_count; s++)
+       dzn_descriptor_set_finish(&pool->sets[s]);
+ 
+    dzn_foreach_pool_type(type) {

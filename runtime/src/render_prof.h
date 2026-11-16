@@ -1,7 +1,7 @@
 // Render-thread profiler shared by both renderers (render_prof.cpp).
 //
 // Cheap enough to stay on: every command op is counted; draws and register writes are timed on one
-// call in 64 (and the phases inside those sampled draws), rare ops (clears, copies, flushes, swaps)
+// call in each block of 64 at a varied position (and the phases inside those sampled draws), rare ops (clears, copies, flushes, swaps)
 // on every call. Upload bytes are split by kind; "unique guest bytes" (the union of the guest ranges
 // that vertex, index and uniform copies read) is measured on one frame in 16. A classifier counts
 // draws whose registers changed only in buffer pointers / ALU constants since the previous draw

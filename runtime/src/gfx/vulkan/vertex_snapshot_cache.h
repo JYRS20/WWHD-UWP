@@ -10,6 +10,7 @@ namespace gfxvk {
 struct VertexSnapshotCacheStats {
     uint64_t requests=0, comparisons=0, hits=0, reusedBytes=0, copiedBytes=0, evictions=0;
     uint64_t shadowBytes=0;
+    uint64_t windowRequests=0,windowHits=0,windowCopiedBytes=0,windowReusedBytes=0,windowReservedBytes=0;
 };
 VertexSnapshotCacheStats vertex_snapshot_associative_stats();
 
@@ -18,6 +19,7 @@ class VertexSnapshotCache {
     struct Entry {
         uint32_t address=0,size=0;
         uint64_t age=0;
+        uint64_t layout=0;
         bool valid=false,direct=false;
         Slice slice{};
         std::vector<uint8_t> bytes;
@@ -26,8 +28,9 @@ class VertexSnapshotCache {
     uintptr_t device=0;
     uint64_t generation=~uint64_t(0),clock=0;
     VertexSnapshotCacheStats counts{};
-    static size_t bucket(uint32_t address,uint32_t size) {
+    static size_t bucket(uint32_t address,uint32_t size,uint64_t layout) {
         uint64_t key=(uint64_t(address)<<32)|size;
+        key^=layout*0x9e3779b97f4a7c15ull;
         key^=key>>30;key*=0xbf58476d1ce4e5b9ull;key^=key>>27;
         return size_t(key%Sets);
     }
@@ -40,17 +43,22 @@ public:
     }
     VertexSnapshotCacheStats stats() const { return counts; }
     template<class Make>
-    Slice get(uint32_t address,uint32_t size,const void* fresh,bool direct,Make&& make) {
+    Slice get(uint32_t address,uint32_t size,const void* fresh,bool direct,Make&& make,uint64_t layout=0) {
+        // layout=0 is a fully initialized prefix. A nonzero layout identifies
+        // (reservation, window offset); those slices never satisfy a prefix request.
         // Ineligible payloads retain the caller's original snapshot path.
         if(!eligible(size))return make(fresh,size);
         ++counts.requests;
-        auto& set=entries[bucket(address,size)];
+        counts.windowRequests+=layout!=0;
+        auto& set=entries[bucket(address,size,layout)];
         Entry* chosen=nullptr;
         for(auto& e:set) {
-            if(!e.valid || e.address!=address || e.size!=size)continue;
+            if(!e.valid || e.address!=address || e.size!=size || e.layout!=layout)continue;
             ++counts.comparisons;
             if(!std::memcmp(fresh,e.direct?e.slice.mapped:e.bytes.data(),size)) {
-                ++counts.hits;counts.reusedBytes+=size;e.age=++clock;return e.slice;
+                ++counts.hits;counts.reusedBytes+=size;
+                if(layout){++counts.windowHits;counts.windowReusedBytes+=size;}
+                e.age=++clock;return e.slice;
             }
             chosen=&e;break; // Changed bytes replace this key; never retain an older version.
         }
@@ -74,8 +82,10 @@ public:
         // The CPU shadow and the GPU slice originate from exactly the same copy.
         auto slice=make(source,size);
         chosen->slice=slice;chosen->address=address;chosen->size=size;
+        chosen->layout=layout;
         chosen->direct=direct;chosen->age=++clock;chosen->valid=true;
         counts.copiedBytes+=size;
+        if(layout){counts.windowCopiedBytes+=size;counts.windowReservedBytes+=slice.size;}
         return slice;
     }
 };

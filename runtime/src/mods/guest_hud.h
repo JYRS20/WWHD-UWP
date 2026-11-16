@@ -159,6 +159,25 @@ public:
         if(it==images.end()||it->second.owner!=owner)return false;
         images.erase(it);return true;
     }
+    // Reposition an entire pending HUD block, including its clip rectangles.
+    // Coordinates are the same authored screen units as the commands. Empty
+    // lists, other anchors and non-overlapping blocks are left unchanged.
+    bool avoid_bottom_left(const std::string& owner,Handle h,float right,float top,float gap) {
+        if(!std::isfinite(right)||!std::isfinite(top)||!std::isfinite(gap)||right<=0||top<=0||gap<0)return false;
+        std::lock_guard lock(mutex);auto it=pending.find(h);
+        if(it==pending.end()||it->second.owner!=owner||it->second.invalid)return false;
+        float left=std::numeric_limits<float>::infinity(),bottom=-left,min_y=left;
+        for(const auto& c:it->second.commands) {
+            if(c.kind==Command::ClipPop)continue;
+            if(c.anchor!=Anchor::TopLeft)return false;
+            left=std::min(left,c.x);min_y=std::min(min_y,c.y);bottom=std::max(bottom,c.y+c.h);
+        }
+        if(left>=right||bottom<=top-gap||!std::isfinite(bottom))return false;
+        const float offset=top-gap-bottom;
+        if(min_y+offset<0)return false;
+        for(auto& c:it->second.commands)if(c.kind!=Command::ClipPop)c.y+=offset;
+        return true;
+    }
     bool commit(const std::string& owner,Handle h) {
         std::lock_guard lock(mutex);auto it=pending.find(h);
         if(it==pending.end()||it->second.owner!=owner)return false;

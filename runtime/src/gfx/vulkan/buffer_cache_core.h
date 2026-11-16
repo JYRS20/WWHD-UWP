@@ -165,6 +165,7 @@ struct Stats {
   uint64_t bypassDynamic = 0, bypassNoMemory = 0, becameDynamic = 0;
   uint64_t verifyChecks = 0, verifyMismatches = 0, verifyRaced = 0;
   uint64_t evictions = 0, epochDrops = 0;
+  uint64_t exactChecks = 0, exactBytes = 0, bypassUnsupported = 0;
 };
 
 enum Status { kHit, kMiss, kBypass };
@@ -173,6 +174,10 @@ class Cache {
  public:
   // verify mode: keep a CPU copy of every upload, so verify() never reads the mapped GPU memory
   bool keepShadow = false;
+  // Optional conservative raw-only backend for hosts without fault tracking.
+  // Reads current guest bytes; null means unavailable. Never use checkedSeq
+  // or compare normalized index output against raw guest input in this mode.
+  const uint8_t* (*exactRawSource)(uint32_t addr, uint32_t size) = nullptr;
   static constexpr uint32_t kChurnLimit = 3, kChurnFrames = 4;
   static constexpr uint64_t kFirstBackoff = 64, kMaxBackoff = 2048;
   static constexpr uint64_t kIdleFrames = 1800;  // evicted after this many frames without use
@@ -191,6 +196,9 @@ class Cache {
   // the uncached path. e stays valid until the next end_frame().
   Status lookup(const Key& key, uint32_t size, Entry*& e) {
     ++stats.lookups;
+    if (exactRawSource && (key.kind != kRaw || !size || uint64_t(key.addr)+size>0x100000000ull)) {
+      e=nullptr;++stats.bypassUnsupported;return kBypass;
+    }
     const uint32_t epoch = epoch_.load(std::memory_order_acquire);
     auto [it, inserted] = map_.try_emplace(key);
     e = &it->second;
@@ -204,9 +212,9 @@ class Cache {
         ++stats.epochDrops;
         drop_region(x);
       } else if (size <= x.size) {
-        if (current(x)) { ++stats.hits; return kHit; }
+        if (current(x,size)) { ++stats.hits; return kHit; }
         ++stats.staleWrites;
-        const bool hintOnly = !wwatch::written_since(x.addr, x.size, x.stamp);
+        const bool hintOnly = !exactRawSource && !wwatch::written_since(x.addr, x.size, x.stamp);
         stats.staleHintOnly += hintOnly;
         if (note_write(x) && onDynamic) onDynamic(key, x, hintOnly);
         drop_region(x);
@@ -221,8 +229,8 @@ class Cache {
       return kBypass;
     }
     // arm first, then the caller reads guest memory (see the header comment)
-    x.armSeq = wwatch::write_seq();
-    x.armStamp = wwatch::arm(key.addr, size);
+    x.armSeq = exactRawSource ? 0 : wwatch::write_seq();
+    x.armStamp = exactRawSource ? 0 : wwatch::arm(key.addr, size);
     x.armSize = size;
     x.armed = true;
     return kMiss;
@@ -232,18 +240,29 @@ class Cache {
   bool upload(Entry& e, const void* bytes, uint32_t outSize) {
     if (!e.armed) return false;
     e.armed = false;
+    if (exactRawSource && (!bytes || outSize!=e.armSize)) {++stats.bypassUnsupported;return false;}
     Region region;
     if (!outSize || !backing_.allocate(round(outSize), region)) {
       ++stats.bypassNoMemory;
       pressure_ = true;
       return false;
     }
-    std::memcpy(region.mapped, bytes, outSize);
-    if (keepShadow) {
+    if (exactRawSource) {
+      // ONE guest snapshot: CPU identity and GPU bytes must agree even when
+      // guest memory is being written concurrently. No mapped GPU reads.
+      try {
+        const auto* b=static_cast<const uint8_t*>(bytes);
+        e.shadow.assign(b,b+outSize);
+        std::memcpy(region.mapped,e.shadow.data(),outSize);
+      } catch (...) {backing_.retire(region);throw;}
+    } else {
+     std::memcpy(region.mapped, bytes, outSize);
+     if (keepShadow) {
       const auto* b = static_cast<const uint8_t*>(bytes);
       e.shadow.assign(b, b + outSize);
-    } else {
+     } else {
       e.shadow.clear();
+     }
     }
     e.region = region;
     e.size = e.armSize;
@@ -270,7 +289,7 @@ class Cache {
     const auto* a = static_cast<const uint8_t*>(expected);
     const uint8_t* have = e.shadow.size() >= n ? e.shadow.data() : e.region.mapped;
     if (!std::memcmp(a, have, n)) return true;
-    if (wwatch::changed_since(e.addr, e.size, e.stamp)) { ++stats.verifyRaced; return true; }
+    if (exactRawSource ? !current(e,n) : wwatch::changed_since(e.addr, e.size, e.stamp)) { ++stats.verifyRaced; return true; }
     ++stats.verifyMismatches;
     if (firstDiff) {
       uint32_t i = 0;
@@ -322,7 +341,16 @@ class Cache {
 
  private:
   static uint64_t round(uint64_t n) { return (std::max<uint64_t>(n, 16) + kAlign - 1) / kAlign * kAlign; }
-  bool current(Entry& e) {
+  bool current(Entry& e,uint32_t requested) {
+    if (exactRawSource) {
+      // The returned Slice exposes requested bytes only. An old larger region
+      // may satisfy a prefix even if its unused tail changed. Every subsequent
+      // larger request compares its own FULL range; no global clean mark is set.
+      if(!requested || requested>e.size)return false;
+      ++stats.exactChecks;stats.exactBytes+=requested;
+      const auto* fresh=exactRawSource(e.addr,requested);
+      return fresh && e.shadow.size()>=requested && !std::memcmp(fresh,e.shadow.data(),requested);
+    }
     const uint64_t seq = wwatch::write_seq();
     if (seq == e.checkedSeq) return true;  // nothing stamped anywhere since the last clean check
     if (wwatch::changed_since(e.addr, e.size, e.stamp)) return false;

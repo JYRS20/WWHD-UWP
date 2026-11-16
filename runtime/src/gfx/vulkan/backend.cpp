@@ -20,6 +20,7 @@
 #include <jni.h>
 #endif
 #include "backend.h"
+#include "index_conversion_memo.h"
 #include "pass.h"
 #include "rendering_path.h"
 #include "stereo.h"
@@ -27,6 +28,7 @@
 #include "attachment_view_usage.h"
 #include "../../build_info.h"
 #include "deferred_commands.h"
+#include "command_trace.h"
 #include "deferred_dispatch.h"
 #include "pipeline_cache_path.h"
 #include "bc_decode.h"
@@ -116,11 +118,20 @@ bool cpu_only_stats_enabled() {
   }();
   return enabled;
 }
-struct WaitTiming { uint64_t count = 0, ns = 0; };
+bool submission_stats_enabled() {
+  static const bool enabled=[] {const char* e=std::getenv("WWHD_VK_SUBMIT_STATS");return e && !std::strcmp(e,"1");}();
+  return enabled;
+}
+bool cadence_only_stats_enabled() {
+  static const bool enabled=[] {const char* e=std::getenv("WWHD_VK_CADENCE_ONLY_STATS");return e && !std::strcmp(e,"1");}();
+  return enabled;
+}
+struct WaitTiming { uint64_t count = 0, ns = 0, maxNs = 0; };
 struct PresentTiming { WaitTiming acquire, compose, present, idle; };
 WaitTiming submitWait, presentSubmitWait, queueSubmitTiming;
 WaitTiming fenceStatusTiming, fenceResetTiming, retirementCleanupTiming;
 WaitTiming commandEndTiming;
+WaitTiming commandPoolResetTiming,descriptorPoolResetTiming;
 std::array<WaitTiming,5> swapPhaseTiming;
 #ifdef __ANDROID__
 VkSemaphore secondarySnapshotSignal=VK_NULL_HANDLE,secondarySnapshotWait=VK_NULL_HANDLE;
@@ -302,12 +313,18 @@ void init_pipeline_cache() try {
 // profWait: also report the wait to the render-thread profiler (render_prof.h)
 template<class F> VkResult timed_call(WaitTiming& timing, F&& call, int profWait = -1) {
   const bool profiled = profWait >= 0 && rprof::enabled();
-  if (!perf_enabled() && !profiled) return call();
+  // Only these infrequent graphics-submission operations are additionally
+  // timed in the focused diagnostic. No per-draw clock or sample extrapolation.
+  const bool exact=submission_stats_enabled() &&
+      (&timing==&commandEndTiming || &timing==&queueSubmitTiming ||
+       &timing==&fenceStatusTiming || &timing==&fenceResetTiming || &timing==&retirementCleanupTiming ||
+       &timing==&commandPoolResetTiming || &timing==&descriptorPoolResetTiming);
+  if (!perf_enabled() && !profiled && !exact) return call();
   auto start = std::chrono::steady_clock::now();
   VkResult result = call();
   const uint64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
       std::chrono::steady_clock::now() - start).count();
-  if (perf_enabled()) { ++timing.count; timing.ns += ns; }
+  if (perf_enabled() || exact) { ++timing.count; timing.ns += ns;timing.maxNs=std::max(timing.maxNs,ns); }
   if (profiled) rprof::add_wait(rprof::Wait(profWait), ns);
   return result;
 }
@@ -1006,9 +1023,9 @@ static void cleanup_submission(Renderer::Submission& slot) {
       vkFreeMemory(R.device, i.memory, nullptr);
   }
   slot.garbageImages.clear();
-  vk_check(vkResetCommandPool(R.device, slot.commandPool, 0),
+  vk_check(timed_call(commandPoolResetTiming,[&]{return vkResetCommandPool(R.device, slot.commandPool, 0);}),
            "reset command pool");
-  vk_check(vkResetDescriptorPool(R.device, slot.descriptorPool, 0),
+  vk_check(timed_call(descriptorPoolResetTiming,[&]{return vkResetDescriptorPool(R.device, slot.descriptorPool, 0);}),
            "reset descriptor pool");
   ++R.submissionGeneration;
 }
@@ -2836,6 +2853,18 @@ void swap() {
     swapPhaseTiming[4].ns+=std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now()-swapBookkeepingStarted).count();
   }
+  if(cadence_only_stats_enabled()) {
+    static auto cadenceStart=std::chrono::steady_clock::now();
+    static uint64_t cadenceFrame=R.frame,cadenceDraws=R.drawCount;
+    if(R.frame-cadenceFrame>=120) {
+      const auto now=std::chrono::steady_clock::now();
+      const double elapsed=std::chrono::duration<double>(now-cadenceStart).count();
+      LOG("[vulkan cadence] frame %llu: %.2f fps; %.1f draws/frame; extra profiling disabled; FPS overlay is independent",
+          (unsigned long long)R.frame,(R.frame-cadenceFrame)/elapsed,
+          double(R.drawCount-cadenceDraws)/(R.frame-cadenceFrame));
+      cadenceStart=now;cadenceFrame=R.frame;cadenceDraws=R.drawCount;
+    }
+  }
   if (perf_enabled() || cpu_only_stats_enabled()) {
     static auto start = std::chrono::steady_clock::now();
     static auto previousSwap = start;
@@ -2871,6 +2900,7 @@ void swap() {
         LOG("[vulkan thread CPU] %.3f ms/frame (excludes sleeping and GPU waits)",
             double(currentThreadCpu - previousThreadCpu) / 1e6 / (R.frame - frame));
       previousThreadCpu = currentThreadCpu;
+      report_command_trace(R.frame,double(R.frame-frame));
       LOG("[vulkan perf] frame %llu %.2f fps, %.1f draws/frame, %.2f MiB uploads/frame, %llu new upload blocks, %.1f passes/frame",
           (unsigned long long)R.frame,(R.frame-frame)/seconds,
           double(R.drawCount-draws)/(R.frame-frame),double(R.uploadBytes-bytes)/(R.frame-frame)/(1<<20),
@@ -2922,6 +2952,57 @@ void swap() {
             (g_stat_texture_check_bytes-checkBytes)/double(1<<20)/frames,
             (g_stat_texture_upload_ns-uploadNs)/1e6/frames);
         checkNs=g_stat_texture_check_ns;checkBytes=g_stat_texture_check_bytes;uploadNs=g_stat_texture_upload_ns;
+          extern uint64_t g_stat_native_watch_ns,g_stat_native_watch_checks,g_stat_native_watch_skips,g_stat_native_watch_verified;
+          static uint64_t nativeNs=0,nativeChecks=0,nativeSkips=0,nativeVerified=0;
+          LOG("[native texture watch] query %.3f ms/frame; %.1f checks/frame; %.1f full hashes avoided/frame; %.1f clean intervals verified/frame",
+              (g_stat_native_watch_ns-nativeNs)/1e6/frames,(g_stat_native_watch_checks-nativeChecks)/frames,
+              (g_stat_native_watch_skips-nativeSkips)/frames,(g_stat_native_watch_verified-nativeVerified)/frames);
+          nativeNs=g_stat_native_watch_ns;nativeChecks=g_stat_native_watch_checks;nativeSkips=g_stat_native_watch_skips;nativeVerified=g_stat_native_watch_verified;
+          extern IndexMemoStats index_conversion_memo_stats();
+          static IndexMemoStats oldIndexMemo{};const auto indexMemo=index_conversion_memo_stats();
+          LOG("[vulkan index memo] %.1f requests/frame; %.1f exact hits/frame; %.1f verified/frame; %.3f MiB input copied/frame; %.3f MiB converted output reused/frame; %.1f evictions/frame",
+              (indexMemo.requests-oldIndexMemo.requests)/frames,(indexMemo.hits-oldIndexMemo.hits)/frames,
+              (indexMemo.verified-oldIndexMemo.verified)/frames,(indexMemo.inputCopied-oldIndexMemo.inputCopied)/1048576.0/frames,
+              (indexMemo.outputReused-oldIndexMemo.outputReused)/1048576.0/frames,(indexMemo.evictions-oldIndexMemo.evictions)/frames);
+          oldIndexMemo=indexMemo;
+          extern uint64_t cached_window_checks();static uint64_t oldCachedWindowChecks=0;
+          const auto cachedChecks=cached_window_checks();
+          LOG("[vulkan cached index windows] %.1f immutable-reference extent verifications/frame; total %llu",
+              (cachedChecks-oldCachedWindowChecks)/frames,(unsigned long long)cachedChecks);
+          oldCachedWindowChecks=cachedChecks;
+      }
+      {
+        static vk::UniformPackStats previous{};
+        const auto pack=vk::uniform_pack_stats();const double frames=double(R.frame-frame);
+        LOG("[vulkan uniform pack memo] %.1f requests/frame; %.1f hits/frame; %.1f planned packs/frame; %.1f original packs/frame; %.1f bypass/frame; %.3f MiB compared/frame; %.1f verified/frame; %.1f KiB retained",
+            (pack.requests-previous.requests)/frames,(pack.hits-previous.hits)/frames,
+            (pack.planned-previous.planned)/frames,(pack.packed-previous.packed)/frames,(pack.bypass-previous.bypass)/frames,
+            (pack.comparedBytes-previous.comparedBytes)/double(1<<20)/frames,
+            (pack.verified-previous.verified)/frames,pack.retainedBytes/1024.0);
+        previous=pack;
+      }
+      {
+        static decltype(R.uniformTiming) previous{};
+        const char* names[3]={"pack","guest_cache","snapshot"};
+        const double frames=double(R.frame-frame);
+        for(size_t i=0;i<3;++i) {
+          const auto& now=R.uniformTiming[i];const auto& old=previous[i];
+          const auto samples=now.samples-old.samples,calls=now.calls-old.calls;
+          if(calls) LOG("[vulkan uniform component] %s: %llu sampled / %llu calls; sampled mean %.3f us/call; estimated %.3f ms/frame; overlaps uniforms phase, not additional CPU time",
+              names[i],(unsigned long long)samples,(unsigned long long)calls,
+              samples?double(now.ns-old.ns)/samples/1e3:0.,
+              samples?double(now.ns-old.ns)*double(calls)/samples/frames/1e6:0.);
+        }
+        previous=R.uniformTiming;
+      }
+      {
+        static SamplerLookupStats previous{};
+        const auto count=sampler_lookup_stats();const double frames=double(R.frame-frame);
+        LOG("[vulkan sampler slots] %.1f requests/frame; %.1f last hits/frame; %.1f slot checks/frame; %.1f slot hits/frame; %.1f map lookups/frame; %.1f verified/frame; two entries per stage/unit",
+            (count.requests-previous.requests)/frames,(count.lastHits-previous.lastHits)/frames,
+            (count.slotChecks-previous.slotChecks)/frames,(count.slotHits-previous.slotHits)/frames,
+            (count.mapLookups-previous.mapLookups)/frames,(count.verified-previous.verified)/frames);
+        previous=count;
       }
       buffer_cache_report(double(R.frame-frame));
 #ifdef WWHD_UWP
@@ -2933,10 +3014,34 @@ void swap() {
             (v.reusedBytes-previous.reusedBytes)/double(1<<20)/frames,
             (v.copiedBytes-previous.copiedBytes)/double(1<<20)/frames,
             (v.evictions-previous.evictions)/frames,v.shadowBytes/double(1<<20));
-        previous=v;
+          LOG("[vulkan vertex windows] cacheable: %.1f requests/frame; %.1f exact hits/frame; %.3f MiB CPU copied/frame; %.3f MiB reused/frame; %.3f MiB upload reservation/frame (reservation is not copied bytes)",
+              (v.windowRequests-previous.windowRequests)/frames,(v.windowHits-previous.windowHits)/frames,
+              (v.windowCopiedBytes-previous.windowCopiedBytes)/double(1<<20)/frames,
+              (v.windowReusedBytes-previous.windowReusedBytes)/double(1<<20)/frames,
+              (v.windowReservedBytes-previous.windowReservedBytes)/double(1<<20)/frames);
+          previous=v;
       }
 #endif
       // CPU-only reports leave per-draw counters/comparison clocks disabled.
+      if(submission_stats_enabled()) {
+        const double frames=double(R.frame-frame);
+        auto reportExact=[&](const char* name,const WaitTiming& timing) {
+          LOG("[vulkan submission exact] frame %llu %s: %llu calls; %.2f calls/frame; %.3f ms/frame; max %.3f ms/call; all calls timed, wall time includes scheduling; graphics queue only",
+              (unsigned long long)R.frame,name,(unsigned long long)timing.count,timing.count/frames,
+              timing.ns/1e6/frames,timing.maxNs/1e6);
+        };
+        reportExact("command_end",commandEndTiming);
+        reportExact("queue_submit",queueSubmitTiming);
+        reportExact("fence_status",fenceStatusTiming);
+        reportExact("fence_reset",fenceResetTiming);
+        reportExact("retirement_cleanup",retirementCleanupTiming);
+        reportExact("command_pool_reset",commandPoolResetTiming);
+        reportExact("descriptor_pool_reset",descriptorPoolResetTiming);
+        // Pool resets are children of retirement_cleanup, not additional costs.
+        commandPoolResetTiming={};descriptorPoolResetTiming={};
+        // Detailed mode below still consumes the same counters for its reports.
+        if(!perf_enabled()) {commandEndTiming={};queueSubmitTiming={};fenceStatusTiming={};fenceResetTiming={};retirementCleanupTiming={};}
+      }
       if (perf_enabled()) {
       double frames = double(R.frame-frame);
       LOG("[vulkan fetch memo] %.1f lookups/frame %.1f last hits/frame",

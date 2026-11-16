@@ -146,6 +146,9 @@ struct Renderer {
   uint64_t pipelineLookups=0,pipelineLastHits=0,pipelineLookasideHits=0,pipelineMapLookups=0;
   std::array<uint64_t,2> descriptorStageMatches{};
  } cpuPreparation;
+ // Opt-in sampled component timing; separate from the broad rprof uniforms phase.
+ struct UniformTimingCounter { uint64_t calls=0,samples=0,ns=0; };
+ std::array<UniformTimingCounter,3> uniformTiming{}; // pack, guest-cache lookup, upload/snapshot
  uint64_t pipelineCreates=0,pipelineCreateNs=0;
  std::array<Surface*,8> passColors{};
  std::array<uint32_t,8> passSlices{};
@@ -215,6 +218,9 @@ void begin_pipeline_pending_frame();
 // Only guest GX2Flush uses this asynchronous path. flush() remains a drain for
 // readbacks and renderer tools; final presentation also waits synchronously.
 void flush_async();
+struct SamplerLookupStats {uint64_t requests=0,lastHits=0,slotChecks=0,slotHits=0,mapLookups=0,verified=0;};
+SamplerLookupStats sampler_lookup_stats();
+void sampler_lookup_self_test(); // synthetic inputs, actual production lookup; renderer smoke only
 void reset_pipeline_lookup_cache();
 uint64_t draw_batch_submissions();
 void vk_check(VkResult result,const char* operation);
@@ -266,7 +272,16 @@ enum class DepthCopyOverride { None, Draw, Unsupported };
 extern DepthCopyOverride g_depthCopyOverride;
 float res_scale();void set_res_scale(float);void latch_res_scale();
 uint64_t next_write_seq();
-inline void mark_gpu_written(Surface* s){s->gpuWritten=true;s->writeSeq=next_write_seq();}
+// Surface epoch (surfaces.cpp): bumped whenever the result of a texture or render-target lookup
+// (find_or_create_surface, sampled views, sampler choice) or the content of a sampled CPU texture can
+// change without a register write: surfaces created or their images destroyed/replaced, CPU texture
+// uploads, GPU writes outside the draw's own targets (clears, copies), CPU copies, save-state resets.
+// The continued-draw fast path (draw.cpp) reuses resolved state only within one epoch.
+extern uint64_t g_surface_epoch;
+inline void mark_gpu_written(Surface* s){s->gpuWritten=true;s->writeSeq=next_write_seq();++g_surface_epoch;}
+// A draw's own attachments: their newer writeSeq can only change lookups at their own addresses,
+// which the fast path excludes (draw.cpp); a surface becoming GPU-written still ends the epoch.
+inline void mark_draw_target_written(Surface* s){if(!s->gpuWritten)++g_surface_epoch;s->gpuWritten=true;s->writeSeq=next_write_seq();}
 }
 
 namespace gfxvk { void reset_feedback_images(); } // Call before device teardown, then drain retirements.

@@ -1,3 +1,4 @@
+#include "platform/uwp_write_guard.h"
 #include "game_clock.h"
 #include "mods/fast_forward.h"
 // Guest threads run on host pthreads. OS synchronization objects live in guest
@@ -176,8 +177,8 @@ static void core_acquire(HostThread* t) {
     if (!g_sched_on || t->holds_core) return;
     static std::once_flag tick;
     std::call_once(tick, [] {
-        std::thread(sched_tick_thread).detach();
-        if (getenv("WWHD_WATCH_MEM")) std::thread(mem_watch_thread).detach();
+        uwp_write_guard::start_thread(sched_tick_thread).detach();
+        if (getenv("WWHD_WATCH_MEM")) uwp_write_guard::start_thread(mem_watch_thread).detach();
     });
     uint32_t core = t->core;
     CoreSched& k = g_sched[core];
@@ -638,7 +639,7 @@ static void* thread_main(void* p) {
 }
 
 #ifdef _WIN32
-static DWORD WINAPI windows_thread_main(void* p) { thread_main(p); return 0; }
+static DWORD WINAPI windows_thread_main(void* p) { uwp_write_guard::run([&]{thread_main(p);}); return 0; }
 #endif
 static void start_host_thread(HostThread* ht) {
 #ifdef _WIN32
@@ -704,7 +705,7 @@ void init(const LoadedModule& m) {
     // debug: WWHD_THREAD_DUMP=s logs every guest thread's state (running/parked, wait object, lr) every s seconds
     if (const char* e = getenv("WWHD_THREAD_DUMP")) {
         int s = atoi(e);
-        std::thread([s] { thread_dump_loop(s); }).detach();
+        uwp_write_guard::start_thread([s] { thread_dump_loop(s); }).detach();
     }
 }
 
@@ -1202,7 +1203,7 @@ static void arm_alarm(uint32_t alarm, uint64_t when, uint64_t period, uint32_t c
     std::lock_guard<std::mutex> lk(g_alarm_mutex);
     if (!g_alarm_thread_started) {
         g_alarm_thread_started = true;
-        std::thread(alarm_thread).detach();
+        uwp_write_guard::start_thread(alarm_thread).detach();
     }
     uint64_t s = g_next_serial++;
     g_alarm_serial[alarm] = s;
@@ -1674,7 +1675,7 @@ void threads_ss_load(ss::Reader& r) {
         }
         if (!g_alarm_queue.empty() && !g_alarm_thread_started) {
             g_alarm_thread_started = true;
-            std::thread(alarm_thread).detach();
+            uwp_write_guard::start_thread(alarm_thread).detach();
         }
     }
     g_alarm_cv.notify_all();

@@ -7,6 +7,8 @@
 #include "overlay.h"
 #ifdef WWHD_UWP
 #include "platform/uwp_browser.h"
+#include "gfx/decorative_grass.h"
+#include "mods/uwp_gc_minimap.h"
 #endif
 #include "pointer.h"
 #ifdef WWHD_SDL_HOST
@@ -890,6 +892,31 @@ void tab_graphics() {
     }
 #endif
     heading("Effects");
+#ifdef WWHD_UWP
+    if(decorative_grass::available()) {
+        bool grass=decorative_grass::enabled();
+        if(check("Reduce distant grass (experimental)",grass,&grass,decorative_grass::healthy()))
+            hostui::post([grass] {decorative_grass::set_enabled(grass);});
+        help("Draw fewer distant grass clumps. Nearby grass keeps its original appearance.\n"
+             "Grass updates and interactions remain active. Applies to this session.\n"
+             "Narrow camera views and stereoscopic 3D use the original drawing path.");
+        ImGui::BeginDisabled(!grass||!decorative_grass::healthy());
+        float grassDistance=decorative_grass::distance();
+        ImGui::SetNextItemWidth(260);
+        if(ImGui::SliderFloat("Grass draw distance",&grassDistance,1000,6000,"%.0f",ImGuiSliderFlags_AlwaysClamp))
+            hostui::post([grassDistance]{decorative_grass::set_distance(grassDistance);});
+        ImGui::SameLine();
+        if(ImGui::Button("Default##grassDistance"))hostui::post([]{decorative_grass::set_distance(6000);});
+        ImGui::EndDisabled();
+        help("Distance in game units. Default: 6000. Lower values can reduce rendering cost\n"
+             "in dense vegetation, but grass will disappear closer to the camera.\n"
+             "Experimental; applies to this session only.");
+        static bool testEffectsScrolled=false;
+        if(!testEffectsScrolled&&getenv("WWHD_TEST_EFFECTS_SCROLL")) {
+            ImGui::SetScrollHereY(0.3f);testEffectsScrolled=true;
+        }
+    }
+#endif
     bool v;
     float bloom = render::bloom_strength() * 100.0f;
     ImGui::SetNextItemWidth(260);
@@ -906,8 +933,23 @@ void tab_graphics() {
         if (i) ImGui::SameLine();
         if (radio(ao[i], render::ao_mode() == i, ao_ok)) post_changed([i] { render::set_ao_mode(i); });
     }
+#ifdef WWHD_UWP
+    // Use the existing AO preference so old installations keep their choice.
+    // This conservative profile changes auxiliary depth only, never game speed
+    // or the user's main resolution, bloom, texture or shadow settings.
+    int effectsProfile=render::ao_hires()?0:1;
+    ImGui::BeginDisabled(!render::feature_available(render::kFeatureAOHires));
+    ImGui::SetNextItemWidth(180);
+    if(combo("Effects profile",&effectsProfile,"Quality\0Balanced\0"))
+        post_changed([effectsProfile] {render::set_ao_hires(effectsProfile==0);});
+    ImGui::EndDisabled();
+    help("Balanced keeps ambient occlusion using the game's smaller depth image.\n"
+         "Quality uses full-size depth for finer contact shading.\n"
+         "Your selected game resolution and other effects are preserved.");
+#else
     if (check("Full-size occlusion depth", render::ao_hires(), &v, render::feature_available(render::kFeatureAOHires)))
         post_changed([v] { render::set_ao_hires(v); });
+#endif
     ImGui::SameLine(0, 30);
     if (check("16x anisotropic filtering", render::aniso(), &v, render::feature_available(render::kFeatureAniso)))
         post_changed([v] { render::set_aniso(v); });
@@ -1326,6 +1368,9 @@ modsui::Host& mods_host() {
 }
 
 void tab_mods() {
+#ifdef WWHD_BUILTIN_GC_MINIMAP
+    uwp_gc_minimap::draw_settings();
+#endif
     auto& h = mods_host();
     h.back = navigation_pressed(input_map::face_input(input_map::kB));
     modsui::draw(h, restart::summary(g_restart_items));

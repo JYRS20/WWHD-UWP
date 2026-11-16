@@ -47,6 +47,9 @@ namespace wwatch {
 // Returns false when write tracking cannot be used on this host.
 bool init(uint8_t* base, uint64_t size);
 bool active();
+#ifdef WWHD_UWP
+bool handle_guarded_write_fault(uintptr_t address) noexcept;
+#endif
 
 // Write-protects the pages of [addr, addr + size) (guest addresses) and returns the stamp to keep:
 // a later written_since(..., stamp) on the same range is true iff a write may have reached it after

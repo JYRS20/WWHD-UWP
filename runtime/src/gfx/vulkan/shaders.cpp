@@ -1239,6 +1239,26 @@ ShaderStats shader_stats() {
     return result;
 }
 
+namespace {
+// Verification only: both algorithms must see the same source snapshot. The
+// game can rewrite guest uniform buffers while its render thread is comparing
+// them; rereading live memory for the reference would report false differences.
+// Non-stereo remapped reads are 16 bytes. Production modes always read live.
+struct UniformReadSnapshot {
+    struct Value {uint32_t address;std::array<uint8_t,16> bytes;};
+    std::vector<Value> values;
+    const void* read(uint32_t address) {
+        for(const auto& value:values) if(value.address==address) return value.bytes.data();
+        Value value{address,{}};std::memcpy(value.bytes.data(),ppc_ptr(address),16);
+        values.push_back(value);return values.back().bytes.data();
+    }
+};
+thread_local UniformReadSnapshot* uniformReadSnapshot=nullptr;
+const void* uniform_bytes(uint32_t address) {
+    return uniformReadSnapshot?uniformReadSnapshot->read(address):ppc_ptr(address);
+}
+}
+
 void pack_uniforms_into(const uint32_t* regs, const Shader& shader,
                         std::vector<uint8_t>& data, float scaleX, float scaleY,
                         float eyeOffset, float convergence) {
@@ -1274,7 +1294,10 @@ void pack_uniforms_into(const uint32_t* regs, const Shader& shader,
             if (!address) continue;
             const size_t blockSize = std::min<uint32_t>(regs[blockBase+group.kcacheBankIdOffset/4+1]+1,0x10000);
             for (const auto& entry : group.entries) {
-                copy(offsets.offset_remapped + entry.mappedIndexOffset, ppc_ptr(address + entry.indexOffset), 16);
+                const int target=offsets.offset_remapped + entry.mappedIndexOffset;
+                const void* source=uniformReadSnapshot && target>=0 && size_t(target)+16<=data.size()
+                    ? uniform_bytes(address+entry.indexOffset) : ppc_ptr(address+entry.indexOffset);
+                copy(target, source, 16);
                 if (entry.indexOffset < blockSize)
                     projectionRow(offsets.offset_remapped+entry.mappedIndexOffset,
                         ppc_ptr(address+entry.indexOffset),blockSize-entry.indexOffset);
@@ -1308,6 +1331,214 @@ void pack_uniforms_into(const uint32_t* regs, const Shader& shader,
     }
 }
 
+namespace {
+constexpr size_t kUniformMemoBudget = 4 * 1024 * 1024;
+size_t uniformMemoBudget = kUniformMemoBudget;
+UniformPackStats uniformPackStats;
+}
+// Compile the immutable byte layout once; never memoize guest-backed values.
+// Dynamic copies retain the original packer's ordering and source reads. Stereo
+// projection keeps the original path because it reads additional matrix state.
+static bool pack_uniforms_planned_into(const uint32_t* regs, const Shader& shader,
+    std::vector<uint8_t>& data, float scaleX, float scaleY, bool gather=false) {
+    const auto& u=shader.uniforms;
+    auto& plan=shader.uniformPackPlan;
+    if(!plan.initialized) {
+        plan.initialized=true;
+        if(!shader.dec || u.offset_endOfBlock<0 || u.offset_endOfBlock>8192 ||
+           u.count_uniformRegister<0 || u.count_uniformRegister>256) return false;
+        const size_t size=(std::max(u.offset_endOfBlock,16)+15)&~15;
+        std::vector<Shader::UniformPackPlan::Copy> copies;
+        std::vector<std::pair<int,size_t>> dynamic;
+        auto fits=[&](int offset,size_t bytes) {return offset>=0 && size_t(offset)<=size && bytes<=size-size_t(offset);};
+        bool valid=true;
+        auto add=[&](uint32_t word,uint32_t offset,uint32_t bytes,int target,bool guest) {
+            if(!fits(target,bytes)) return; // the original bounds-checked copy is also a no-op
+            if(word>=0x10000 || (!guest && bytes/4>0x10000-word)) {valid=false;return;}
+            copies.push_back({word,offset,bytes,target,guest});dynamic.push_back({target,bytes});
+        };
+        const uint32_t alu=mmSQ_ALU_CONSTANT0_0+(shader.vertex?0x400:0);
+        const uint32_t block=shader.vertex?mmSQ_VTX_UNIFORM_BLOCK_START:mmSQ_PS_UNIFORM_BLOCK_START;
+        if(u.offset_remapped>=0) {
+            for(const auto& entry:shader.dec->list_remappedUniformEntries_register)
+                add(alu+entry.indexOffset/4,0,16,u.offset_remapped+entry.mappedIndexOffset,false);
+            for(const auto& group:shader.dec->list_remappedUniformEntries_bufferGroups)
+                for(const auto& entry:group.entries)
+                    add(block+group.kcacheBankIdOffset/4,entry.indexOffset,16,u.offset_remapped+entry.mappedIndexOffset,true);
+        }
+        if(u.offset_uniformRegister>=0 && u.count_uniformRegister)
+            add(alu,0,uint32_t(u.count_uniformRegister)*16,u.offset_uniformRegister,false);
+        add(Latte::REGADDR::SX_ALPHA_REF,0,4,u.offset_alphaTestRef,false);
+        // These fields are written after dynamic copies. Do not hoist constant
+        // texture scales across them if a malformed layout overlaps the writes.
+        if(fits(u.offset_pointSize,4)) dynamic.push_back({u.offset_pointSize,4});
+        for(int offset:{u.offset_windowSpaceToClipSpaceTransform,u.offset_windowSpaceToClipSpaceTransform<0?-1:u.offset_windowSpaceToClipSpaceTransform+4})
+            if(fits(offset,4)) dynamic.push_back({offset,4});
+        if(fits(u.offset_fragCoordScale,16)) dynamic.push_back({u.offset_fragCoordScale,16});
+        if(!valid || copies.size()>1024) return false;
+        std::vector<uint8_t> base(size,0);
+        for(int offset:u.offset_texScale) {
+            if(!fits(offset,8)) continue;
+            for(auto [start,bytes]:dynamic)
+                if(size_t(start)<size_t(offset)+8 && size_t(offset)<size_t(start)+bytes) return false;
+            const float scale[2]={1,1};std::memcpy(base.data()+offset,scale,8);
+        }
+        if(gather) {
+            // Preserve write order. Merge only adjacent reads AND adjacent
+            // destinations: no skipped bytes, reordered writes or sparse hashes.
+            size_t count=0;
+            for(const auto copy:copies) {
+                if(count) {
+                    auto& previous=copies[count-1];
+                    const bool adjacentSource=previous.guest==copy.guest &&
+                        (copy.guest ? previous.word==copy.word &&
+                            uint64_t(previous.sourceOffset)+previous.bytes==copy.sourceOffset
+                         : uint64_t(previous.word)*4+previous.bytes==uint64_t(copy.word)*4);
+                    if(adjacentSource && int64_t(previous.target)+previous.bytes==copy.target) {
+                        previous.bytes+=copy.bytes;continue;
+                    }
+                }
+                copies[count++]=copy;
+            }
+            copies.resize(count);
+        }
+        const size_t retained=base.capacity()+copies.capacity()*sizeof(Shader::UniformPackPlan::Copy);
+        if(retained>uniformMemoBudget) return false;
+        uniformMemoBudget-=retained;
+        plan.zeroTemplate=std::move(base);plan.copies=std::move(copies);plan.eligible=true;
+    }
+    if(!plan.eligible) return false;
+    data=plan.zeroTemplate; // all gaps/padding and constant texture scales defined
+    for(const auto& copy:plan.copies) {
+        const void* source;
+        if(copy.guest) {
+            const uint32_t address=regs[copy.word];
+            if(!address) continue;
+            if(gather) {
+                // The original additions wrap at 32 bits per vec4. A merged
+                // range may not cross that boundary; keep its original path.
+                if(uint64_t(address)+copy.sourceOffset+copy.bytes>uint64_t(1)<<32) return false;
+                if(uniformReadSnapshot) {
+                    // Both packers observe the same immutable vec4 sources in
+                    // verification mode, even when a guest thread writes later.
+                    for(uint32_t offset=0;offset<copy.bytes;offset+=16)
+                        std::memcpy(data.data()+copy.target+offset,
+                            uniform_bytes(address+copy.sourceOffset+offset),16);
+                    continue;
+                }
+                source=ppc_ptr(address+copy.sourceOffset);
+            } else source=uniform_bytes(address+copy.sourceOffset);
+        } else source=regs+copy.word;
+        // Keep the frequent vec4/scalar copies inline. A runtime-sized memcpy
+        // for every 16-byte entry would undo the layout-plan saving.
+        if(copy.bytes==16) std::memcpy(data.data()+copy.target,source,16);
+        else if(copy.bytes==4) std::memcpy(data.data()+copy.target,source,4);
+        else std::memcpy(data.data()+copy.target,source,copy.bytes);
+    }
+    auto put=[&](int offset,float value) {
+        if(offset>=0 && size_t(offset)+4<=data.size()) std::memcpy(data.data()+offset,&value,4);
+    };
+    if(u.offset_pointSize>=0) {
+        const float point=float(regs[Latte::REGADDR::PA_SU_POINT_SIZE]&0xffff)/8.0f;
+        put(u.offset_pointSize,(point==0?0.125f:point)*scaleX);
+    }
+    auto bitsf=[](uint32_t bits) {float f;std::memcpy(&f,&bits,4);return f;};
+    if(u.offset_windowSpaceToClipSpaceTransform>=0) {
+        const float width=2.0f*bitsf(regs[Latte::REGADDR::PA_CL_VPORT_XSCALE]);
+        const float height=-2.0f*bitsf(regs[Latte::REGADDR::PA_CL_VPORT_YSCALE]);
+        put(u.offset_windowSpaceToClipSpaceTransform,width!=0?2.0f/width:0);
+        put(u.offset_windowSpaceToClipSpaceTransform+4,height!=0?2.0f/height:0);
+    }
+    if(u.offset_fragCoordScale>=0 && size_t(u.offset_fragCoordScale)+16<=data.size()) {
+        const float scale[4]={scaleX!=0?1.0f/scaleX:1.0f,scaleY!=0?1.0f/scaleY:1.0f,0,0};
+        std::memcpy(data.data()+u.offset_fragCoordScale,scale,16);
+    }
+    return true;
+}
+
+UniformPackStats uniform_pack_stats() {
+    auto result=uniformPackStats;
+    result.retainedBytes=kUniformMemoBudget-uniformMemoBudget;
+    return result;
+}
+void pack_uniforms_cached_into(const uint32_t* regs, const Shader& shader,
+    std::vector<uint8_t>& data, float scaleX, float scaleY, float eyeOffset, float convergence) {
+    static const int mode=[] {
+        const char* e=std::getenv("WWHD_VK_UNIFORM_PACK");
+        return e && !std::strcmp(e,"baseline") ? 0 : e && !std::strcmp(e,"verify") ? 2
+            : e && !std::strcmp(e,"gather") ? 3 : e && !std::strcmp(e,"gather-verify") ? 4 : 1;
+    }();
+    ++uniformPackStats.requests;
+    auto original=[&] { ++uniformPackStats.packed; pack_uniforms_into(regs,shader,data,scaleX,scaleY,eyeOffset,convergence); };
+    if (!mode || !shader.dec || eyeOffset != 0) { ++uniformPackStats.bypass; original(); return; }
+    UniformReadSnapshot* snapshot=nullptr;
+    if(mode==2 || mode==4) {
+        static thread_local UniformReadSnapshot sources;
+        sources.values.clear();snapshot=&sources;
+    }
+    struct SnapshotScope {
+        UniformReadSnapshot* previous=nullptr;
+        bool active;
+        SnapshotScope(UniformReadSnapshot* current):active(current!=nullptr) {
+            if(active) {previous=uniformReadSnapshot;uniformReadSnapshot=current;}
+        }
+        ~SnapshotScope() {if(active) uniformReadSnapshot=previous;}
+    } snapshotScope(snapshot);
+    auto verify=[&] {
+        if(mode!=2 && mode!=4) return;
+        static thread_local std::vector<uint8_t> expected;
+        pack_uniforms_into(regs,shader,expected,scaleX,scaleY,eyeOffset,convergence);
+        ++uniformPackStats.verified;
+        if(data!=expected) throw std::runtime_error("uniform packing: byte verification failed on identical source snapshot");
+    };
+    auto prepare=[&] {
+        if(pack_uniforms_planned_into(regs,shader,data,scaleX,scaleY,mode>=3)) {++uniformPackStats.planned;verify();}
+        else {++uniformPackStats.bypass;original();}
+    };
+    // This experiment measures the compact gather plan alone, independently
+    // of the older register-input memo and its comparisons.
+    if(mode>=3) {prepare();return;}
+    auto& memo=shader.uniformPackMemo;
+    if (!memo.initialized) {
+        memo.initialized=true;
+        const auto& u=shader.uniforms;
+        // Guest memory can change without a register write. This memo observes
+        // render-thread registers only; guest-backed plans always read afresh.
+        if (shader.dec->list_remappedUniformEntries_bufferGroups.empty() &&
+            u.offset_endOfBlock>=0 && u.offset_endOfBlock<=8192 &&
+            u.count_uniformRegister>=0 && u.count_uniformRegister<=256) {
+            std::vector<UniformPackMemo::Range> sources;
+            const uint32_t base=mmSQ_ALU_CONSTANT0_0+(shader.vertex?0x400:0);
+            bool valid=true;
+            if (u.offset_remapped>=0)
+                for (const auto& entry:shader.dec->list_remappedUniformEntries_register) {
+                    if (entry.indexOffset>4096-16 || entry.indexOffset%4) {valid=false;break;}
+                    sources.push_back({base+entry.indexOffset/4,16});
+                }
+            if (u.offset_uniformRegister>=0 && u.count_uniformRegister)
+                sources.push_back({base,uint32_t(u.count_uniformRegister)*16});
+            if (u.offset_alphaTestRef>=0) sources.push_back({Latte::REGADDR::SX_ALPHA_REF,4});
+            if (u.offset_pointSize>=0) sources.push_back({Latte::REGADDR::PA_SU_POINT_SIZE,4});
+            if (u.offset_windowSpaceToClipSpaceTransform>=0) {
+                sources.push_back({Latte::REGADDR::PA_CL_VPORT_XSCALE,4});
+                sources.push_back({Latte::REGADDR::PA_CL_VPORT_YSCALE,4});
+            }
+            if (valid) memo.initialize(std::move(sources),(std::max(u.offset_endOfBlock,16)+15)&~15,uniformMemoBudget);
+        }
+    }
+    if (!memo.eligible) { prepare(); return; }
+    std::array<uint32_t,2> scales;
+    std::memcpy(&scales[0],&scaleX,4);std::memcpy(&scales[1],&scaleY,4);
+    if (memo.matches(regs,scales,uniformPackStats.comparedBytes)) {
+        ++uniformPackStats.hits;
+        memo.copy_to(data);
+        verify();
+        return;
+    }
+    prepare();
+    memo.store(regs,scales,data);
+}
+
 std::vector<uint8_t> pack_uniforms(const uint32_t* regs, const Shader& shader,
                                    float scaleX, float scaleY) {
     std::vector<uint8_t> data;
@@ -1316,6 +1547,9 @@ std::vector<uint8_t> pack_uniforms(const uint32_t* regs, const Shader& shader,
 }
 
 void reset_shader_memoization() {
+    for (auto& [key, shader] : shaders) {shader->uniformPackMemo = {};shader->uniformPackPlan = {};}
+    uniformMemoBudget = kUniformMemoBudget;
+
     stateMemo.reset();
     lastFetch = {};
     programHashes.clear();

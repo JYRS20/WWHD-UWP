@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "platform/host.h"
+#include "platform/uwp_write_guard.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -78,9 +79,10 @@ bool on_write_fault(uintptr_t a) {
 }
 
 #if defined(WWHD_UWP)
-// AppContainer cannot install a vectored exception handler. Never arm read-only pages:
-// init returns false and callers use conservative sampled/hash change checks instead.
-bool install_handler() { return false; }
+// Optional structured guards surround the native game/render/service thread
+// roots. No desktop VEH API is imported. Without a guarded initializing root,
+// never arm pages: callers retain the conservative fallback.
+bool install_handler() { return uwp_write_guard::enabled() && uwp_write_guard::active(); }
 #elif defined(_WIN32)
 LONG CALLBACK veh(EXCEPTION_POINTERS* e) {
     const EXCEPTION_RECORD* r = e->ExceptionRecord;
@@ -149,6 +151,9 @@ bool init(uint8_t* base, uint64_t size) {
 }
 
 bool active() { return g_active.load(std::memory_order_acquire); }
+#ifdef WWHD_UWP
+bool handle_guarded_write_fault(uintptr_t address) noexcept {return on_write_fault(address);}
+#endif
 
 uint64_t arm(uint32_t addr, uint32_t size) {
     uint64_t t0 = g_clock.load(std::memory_order_acquire), first, last;

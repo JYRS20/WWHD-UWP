@@ -16,6 +16,8 @@ struct UploadSlice;
 
 bool buffer_cache_enabled();
 bool buffer_cache_verify();
+bool buffer_cache_exact_raw(); // opt-in UWP persistent raw-byte comparison backend
+bool buffer_cache_indices_enabled();
 bufcache::Cache& buffer_cache();
 // the entry's region as a draw binding of size bytes
 UploadSlice buffer_cache_slice(const bufcache::Entry& entry, uint64_t size);

@@ -1,0 +1,17 @@
+{
+  "upstream_sha256": "9798ef3fc50bacaacede591de4453c49ebf579a6e6c4006cfb20a6d948e88ab0",
+  "base": 2139095040,
+  "size": 2227696,
+  "image_size": 2227696,
+  "functions": 562,
+  "game_code_embedded": false,
+  "translated_sha256": "8b7654bf871a10bc85bff7e4b35cc652b5f6d7c30624c221b5459b0ee6e2c7a4",
+  "logical_tv_size": [
+    1280,
+    720
+  ],
+  "upstream_commit": "ba91da26470999767e26d3fecc9467ad21bb344d",
+  "adapter_version": "1.3.0-uwp.2",
+  "presentation_source": "presentation.c.in",
+  "presentation_sha256": "9d974619e7b8abe4a4c59b16eb543d9f01adf44c6c89c0cfb74ef0a13ff13dd9"
+}

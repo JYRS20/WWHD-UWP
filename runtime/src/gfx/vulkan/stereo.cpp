@@ -48,6 +48,8 @@ void stereo_select_eye(int eye) {
     std::swap(R.mainDepthAddr, otherMainDepth);
     stereo_swap_ao();
     stereoEye = eye;
+    // Surface lookups now resolve in the other eye's cache: end the fast path's continuation (backend.h).
+    ++g_surface_epoch;
 }
 void stereo_latch() {
     const bool wasOff=stereo::frame.mode==stereo::Off;
@@ -60,6 +62,7 @@ void stereo_latch() {
             for (auto& [addr,s]:otherSurfaces) destroy_surface_image(s.get());
             otherSurfaces.clear();
             otherLinearTargets.clear();
+            ++g_surface_epoch;
             otherMainDepth=0;
             stereo_release_ao();
             destroy_surface_image(stereoRight.scan.get());

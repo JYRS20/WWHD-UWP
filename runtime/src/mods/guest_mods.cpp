@@ -57,8 +57,23 @@
 
 #include "recomp_table.h"
 #include "runtime.h"
+#ifdef WWHD_UWP
+#include "gfx/decorative_grass.h"
+#endif
 #include "../platform/host.h"
 #include "wwhd_guest_abi.h"
+#ifdef WWHD_BUILTIN_GC_MINIMAP
+#include "uwp_gc_minimap.h"
+extern "C" const WWHDGuestModuleV1* gc_minimap_module_v1(const WWHDGuestHostV1*);
+#endif
+#ifdef WWHD_BUILTIN_HD_MINIMAP
+extern "C" const WWHDGuestModuleV1* hd_minimap_module_v1(const WWHDGuestHostV1*);
+extern "C" uint32_t hd_minimap_patch_address_0(void);
+extern "C" uint32_t hd_minimap_patch_value_0(void);
+extern "C" uint32_t hd_minimap_option_address(unsigned);
+extern "C" void hd_minimap_set_view(float,int);
+extern "C" uint32_t hd_minimap_debug_state(unsigned);
+#endif
 
 extern "C" {
 unsigned g_mod_hook_count = 0;  // initialized only by a hook-enabled game-code build
@@ -101,6 +116,9 @@ struct Loaded {
     std::unique_ptr<Files> files;
 };
 std::vector<Loaded> g_loaded;
+#ifdef WWHD_BUILTIN_HD_MINIMAP
+bool g_hd_minimap_active=false;
+#endif
 std::atomic<uint64_t> g_logic_step{0};
 std::atomic<bool> g_hud_callbacks{false};
 std::mutex g_hud_mutex;
@@ -505,15 +523,15 @@ std::string notebook_model(const std::filesystem::path& glb,const std::string& d
     return std::filesystem::is_regular_file(out,ec)?out.string():std::string();
 }
 
-bool load_one(const std::string& path, std::string& err,const mods::packages::GuestPackage& pkg,uint32_t base,uint32_t reserved) {
+bool load_one(const std::string& path, std::string& err,const mods::packages::GuestPackage& pkg,uint32_t base,uint32_t reserved,WWHDGuestInitV1 builtin=nullptr) {
 #ifdef _WIN32
-    void* lib = (void*)LoadLibraryA(path.c_str());
-    auto init = lib ? (WWHDGuestInitV1)(void*)GetProcAddress((HMODULE)lib, WWHD_GUEST_INIT_SYMBOL) : nullptr;
+    void* lib = builtin ? nullptr : (void*)LoadLibraryA(path.c_str());
+    auto init = builtin ? builtin : lib ? (WWHDGuestInitV1)(void*)GetProcAddress((HMODULE)lib, WWHD_GUEST_INIT_SYMBOL) : nullptr;
 #else
-    void* lib = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
-    auto init = lib ? (WWHDGuestInitV1)dlsym(lib, WWHD_GUEST_INIT_SYMBOL) : nullptr;
+    void* lib = builtin ? nullptr : dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+    auto init = builtin ? builtin : lib ? (WWHDGuestInitV1)dlsym(lib, WWHD_GUEST_INIT_SYMBOL) : nullptr;
 #endif
-    if (!lib) { err = "cannot load the module"; return false; }
+    if (!lib && !builtin) { err = "cannot load the module"; return false; }
     struct LibraryGuard {
         void* handle;
         ~LibraryGuard() {
@@ -663,6 +681,64 @@ void init() {
         if(result.module.empty()||!load_one(result.module,error,pkg,base,result.allocation_size))
             exception_report::raise(error.empty()?"Guest builder returned no module":error);
     });
+    bool hdMinimapActive=false;
+#ifdef WWHD_BUILTIN_HD_MINIMAP
+    if(const char* selected=std::getenv("WWHD_UWP_HD_MINIMAP");selected&&!std::strcmp(selected,"1")) {
+        if(std::string(g_guest_build_name)!="USA"||!g_mod_hook_count)
+            LOG("[HD minimap] Requires the USA v0 hook-enabled game");
+        else if(std::any_of(g_loaded.begin(),g_loaded.end(),[](const Loaded& m){return m.id=="gc-minimap"||m.id=="hd-minimap";}))
+            LOG("[HD minimap] An external minimap is already active; disable it before selecting the curated HD map");
+        else {
+            const uint32_t address=hd_minimap_patch_address_0();
+            const uint32_t previous=ld32(address);
+            if(ordinal_of(previous)<0)LOG("[HD minimap] Native dungeon draw pointer is not recognized; not loaded");
+            else {
+                packages::GuestPackage pkg;pkg.id="hd-minimap";pkg.name="Minimap HD";pkg.version="1.3.0-uwp.2";
+                pkg.path=(std::filesystem::u8path(host::executable_path()).parent_path()/"hd-minimap").string();
+                pkg.data_path=(std::filesystem::u8path(host::config_dir())/"ModData"/"hd-minimap").string();
+                std::string error;
+                if(load_one("builtin:hd-minimap",error,pkg,0x7F800000,0x400000,hd_minimap_module_v1)) {
+                    // All module addresses/hooks are validated before publishing
+                    // the native dungeon layout's draw callback in guest memory.
+                    st32(address,hd_minimap_patch_value_0());
+                    const auto options=uwp_gc_minimap::hd_options();
+                    const bool fade=options.get("fade").boolean;
+                    const float maximum=float(options.get("maximum").number),minimum=float(options.get("minimum").number);
+                    const uint32_t values[]={0,uint32_t(fade),uint32_t(fade),uint32_t(options.get("background").boolean),0,0,uint32_t(options.get("wind").boolean)};
+                    for(unsigned i=0;i<7;++i){
+                        const uint32_t field=hd_minimap_option_address(i);
+                        if(field<0x7F800000||field>0x7FC00000-4)exception_report::raise("Invalid curated minimap option address");
+                        if(i==0)stf32(field,float(options.get("background_opacity").number)*255.f);
+                        else if(i==4)stf32(field,maximum*255.f);
+                        else if(i==5)stf32(field,minimum*255.f);
+                        else st32(field,values[i]);
+                    }
+                    hd_minimap_set_view(float(options.get("size").number),options.get("fit_islands").boolean);
+                    hdMinimapActive=true;
+                    g_hd_minimap_active=true;
+                    LOG("[HD minimap] Chironeyes Minimap HD 1.3 USA adapter loaded; native maps, no GameCube extraction");
+                } else LOG("[HD minimap] Not loaded: %s",error.c_str());
+            }
+        }
+    }
+#endif
+#ifdef WWHD_BUILTIN_GC_MINIMAP
+    // The curated module contains only the mod author's code. It uses exactly
+    // the same validation, guest isolation and HUD services as external modules.
+    // Private trial: absent selectors leave the feature entirely inactive.
+    if(const char* data=std::getenv("WWHD_UWP_GC_MINIMAP_DATA");!hdMinimapActive&&data&&*data) {
+        const char* assets=std::getenv("WWHD_UWP_GC_MINIMAP_PACKAGE");
+        const bool already_loaded=std::any_of(g_loaded.begin(),g_loaded.end(),[](const Loaded& m){return m.id=="gc-minimap";});
+        if(already_loaded)LOG("[gc minimap] External package already loaded; curated copy stays inactive");
+        else if(assets&&*assets&&std::string(g_guest_build_name)=="USA"&&g_mod_hook_count) {
+            packages::GuestPackage pkg;pkg.id="gc-minimap";pkg.name="GameCube minimap";pkg.version="0.3.0";
+            pkg.path=assets;pkg.data_path=data;pkg.options=uwp_gc_minimap::options();
+            std::string error;
+            if(!load_one("builtin:gc-minimap",error,pkg,0x7FF00000,0x50000,gc_minimap_module_v1))
+                LOG("[gc minimap] Not loaded: %s",error.c_str());
+        } else LOG("[gc minimap] Requires USA code hooks and a prepared package");
+    }
+#endif
     // The item icons (item_icons.h): the notebook (key 0), then the mod items in declaration order (frames
     // 56...), built into the game's 2D pack before the game opens it; the mod items draw from those frames.
     // (test aid WWHD_TEST_ITEM_ICONS=a.png,b.png adds pictures as more items)
@@ -819,6 +895,15 @@ void init() {
         ch.addr=addr;ch.ordinal=uint32_t(ordinal);ch.replace=fn;ch.replace_mod="the port's story progress";
         g_mod_hook_flags[ordinal]=1;
     });
+#ifdef WWHD_UWP
+    decorative_grass::install(call_original,[](uint32_t addr,PpcFunc fn) {
+        if(!g_mod_hook_flags||!g_mod_bodies||g_mod_hook_count!=g_recomp_func_count||g_chains.contains(addr))return false;
+        const int ordinal=ordinal_of(addr);if(ordinal<0)return false;
+        Chain& ch=g_chains[addr];ch.addr=addr;ch.ordinal=uint32_t(ordinal);
+        ch.replace=fn;ch.replace_mod="experimental grass draw distance";
+        g_mod_hook_flags[ordinal]=1;return true;
+    });
+#endif
     if(getenv("WWHD_GUEST_MODS"))LOG("[guestmods] WWHD_GUEST_MODS is retired; install and trust guest packages in the mod manager");
 }
 
@@ -828,7 +913,16 @@ std::vector<ModIdentity> enabled_mods() {
 
 bool hooks_built() { return g_mod_hook_count != 0 && g_mod_hook_flags && g_mod_bodies; }
 
-void frame(uint64_t step) {g_logic_step.store(step,std::memory_order_relaxed);story_notebook::logic_step(step);}
+void frame(uint64_t step) {
+    g_logic_step.store(step,std::memory_order_relaxed);story_notebook::logic_step(step);
+#ifdef WWHD_BUILTIN_HD_MINIMAP
+    if(g_hd_minimap_active && std::getenv("WWHD_UWP_HD_MINIMAP_DIAGNOSTIC")) {
+        static uint32_t last=~0u;const uint32_t source=ld32(0x101F5088),buttons=source?ld32(source+0x124):0;
+        const uint32_t boat=hd_minimap_debug_state(3),map=hd_minimap_debug_state(0),dungeon=hd_minimap_debug_state(1);
+        if(buttons!=last||step%120==0){last=buttons;LOG("[HD input diagnostic] step %llu native=%08X boat=%u gate=%u request=%u view=%u coverage=%u island=%u mapVisible=%u dungeon=%u/%u",(unsigned long long)step,buttons,ld32(map+0x7c),ld32(boat+8),ld32(boat+0xb4),ld32(boat+4),ld32(boat+0xb8),ld32(map+0x44),ld32(map+0x10),ld32(dungeon+0x10),ld32(dungeon+0x9c));}
+    }
+#endif
+}
 void draw_frame(Cpu* c,uint64_t step) {
     if(!c||!g_hud_callbacks.load(std::memory_order_acquire))return;
     for(auto& mod:g_loaded) {
@@ -841,13 +935,29 @@ void draw_frame(Cpu* c,uint64_t step) {
         auto list=hud::store().begin(mod.id,screen);
         if(!list){hud::store().drop(mod.id);continue;}
         Cpu saved=*c;
-        try {guest_call(c,callback,{list});hud::store().commit(mod.id,list);}
+        try {
+            guest_call(c,callback,{list});
+#ifdef WWHD_BUILTIN_GC_MINIMAP
+            // USA native riding query (same flag the game's own map uses).
+            // Leave the native compasses intact and move only our curated HUD.
+            if(mod.path=="builtin:gc-minimap") {
+                const bool aboard=guest_call(c,0x02638FA8u)!=0;
+                if(aboard)hud::store().avoid_bottom_left(mod.id,list,220.f,600.f,12.f);
+                static thread_local int previous=-1;
+                if(previous!=int(aboard)){previous=int(aboard);LOG("[gc minimap] layout mode=%s",aboard?"boat":"foot");}
+            }
+#endif
+            hud::store().commit(mod.id,list);
+        }
         catch(...) {hud::store().fail(mod.id,list,"HUD callback failed; draw list dropped");hud::store().commit(mod.id,list);}
         *c=saved;
     }
 }
 void service(Cpu* c) { story_lyt_screen::service(c); }
 void state_loaded() {
+#ifdef WWHD_UWP
+    decorative_grass::state_loaded();
+#endif
     std::lock_guard lock(g_hud_mutex);
     hud::store().reset();
     pcm::store().reset();

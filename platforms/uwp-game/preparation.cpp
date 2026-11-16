@@ -359,7 +359,7 @@ struct Screen {
 };
 }
 WwhdPreparedGame wwhd_prepare_and_load(){
- preparation_log=fs::current_path()/L"wwhd-prepare.log";write(preparation_log,"WWHD UWP unified preparation 0.1.4\n");
+ preparation_log=fs::current_path()/L"wwhd-prepare.log";write(preparation_log,"WWHD UWP unified preparation 0.1.8\n");
  Screen screen;State state;size_t selected=0;bool running=false,quit=false;
  StorageFolder browse_drive{nullptr},browse_folder{nullptr};std::vector<StorageFolder> parents;
  std::thread worker([&]{scan(state);});

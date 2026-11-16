@@ -140,6 +140,18 @@ struct StepPlan {
     int64_t start;
     StepStart how;
 };
+// Wall-clock schedule, including 60 fps without display step slots. Keep a small
+// render overrun as debt: restarting the clock each step hides asynchronous render
+// work and admits another hold on every step. A stall of a whole step resets the
+// schedule instead of running a long burst of catch-up logic.
+inline StepPlan wall_step_start(int64_t now, int64_t previous, int64_t step, bool wait, bool valid) {
+    const int64_t due = previous + step;
+    if (!wait || !valid) return {now, StepStart::kLate};
+    if (now < due) return {due, StepStart::kWait};
+    if (now - due < step) return {due, StepStart::kKeep};
+    return {now, StepStart::kLate};
+}
+
 inline StepPlan slot_step_start(int64_t now, int64_t slot, int64_t frame, int64_t step, bool wait) {
     const int64_t start = slot - frame;
     if (wait && now < start) return {start, StepStart::kWait};

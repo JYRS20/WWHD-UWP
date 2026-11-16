@@ -12,8 +12,11 @@
 #include "stereo.h"
 #include "../stereo_projection.h"
 #include "sampler_filtering.h"
+#include "sampler_slot_memo.h"
+#include "index_conversion_memo.h"
 #include "deferred_dispatch.h"
 #include "buffer_cache.h"
+#include "gx2/state_groups.h"
 #include "render_prof.h"
 #include "runtime.h"
 #include "gx2/gx2.h"
@@ -51,6 +54,21 @@ bool preparation_stats_enabled() {
   static const bool enabled=std::getenv("WWHD_VK_STATS")!=nullptr;
   return enabled;
 }
+bool uniform_timing_enabled() {
+  static const bool enabled=[] {const char* e=std::getenv("WWHD_VK_UNIFORM_TIMING");return e&&!std::strcmp(e,"1");}();
+  return enabled;
+}
+struct UniformComponentTimer {
+  decltype(R.uniformTiming)::value_type* counter=nullptr;
+  uint64_t start=0;
+  explicit UniformComponentTimer(size_t component) {
+    if(uniform_timing_enabled()) {
+      counter=&R.uniformTiming[component];++counter->calls;
+      if(rprof::g_draw_sampled) {++counter->samples;start=rprof::now_ns();}
+    }
+  }
+  ~UniformComponentTimer() {if(start)counter->ns+=rprof::now_ns()-start;}
+};
 // Bounded overlap; UWP uses smaller lists to limit Dozen temporary resources. An explicit
 // zero/invalid WWHD_VK_DRAW_BATCH disables it.
 uint32_t parse_draw_batch(const char* text) {
@@ -161,6 +179,8 @@ UploadSlice snapshot(const void *data, size_t size, VkDeviceSize alignment) {
 }
 
 VertexSnapshotCache<UploadSlice> associativeVertices;
+IndexConversionMemo<> indexConversionMemo;
+uint64_t cachedWindowChecks=0;
 UploadSlice vertex_snapshot(uint32_t binding, uint32_t address, uint32_t size,
                             bool bounded) {
   static const bool enabled = [] {
@@ -265,6 +285,25 @@ UploadSlice vertex_window_snapshot(uint32_t binding,uint32_t address,uint32_t re
     return e && !std::strcmp(e,"1");}();
   Entry* entry=reuse && binding<entries.size()?&entries[binding]:nullptr;
   const auto* fresh=static_cast<const uint8_t*>(source?source:mem::ptr(address))+begin;
+#ifdef WWHD_UWP
+  static const bool associativeWindows=[] {
+    const char* e=std::getenv("WWHD_UWP_VERTEX_WINDOWS");return e && !std::strcmp(e,"1");
+  }();
+  if(associativeWindows && reuse && binding<16 && associativeVertices.eligible(length)) {
+    associativeVertices.begin(reinterpret_cast<uintptr_t>(R.device),R.submissionGeneration);
+    // Keep the original binding offset and gl_VertexIndex/baseVertex. Only
+    // proven reachable bytes are initialized; never reuse this as a full prefix.
+    const uint64_t layout=(uint64_t(reservation)<<32)|begin;
+    return associativeVertices.get(address,length,fresh,false,
+        [&](const void* bytes,size_t n) {
+          auto slice=allocate_upload(std::max<uint32_t>(reservation,16),4);
+          if(poisonUnused)std::memset(slice.mapped,0xCD,slice.size);
+          std::memcpy(static_cast<uint8_t*>(slice.mapped)+begin,bytes,n);
+          if(slice.size>reservation)std::memset(static_cast<uint8_t*>(slice.mapped)+reservation,0,slice.size-reservation);
+          return slice;
+        },layout);
+  }
+#endif
   // compares the entry's CPU copy of the window, not the mapped slice, unless the entry was made with
   // direct reads (host-cached upload memory; vertex_snapshot_history.h)
   if(entry && entry->matches(address,reservation,begin,length)) {
@@ -1227,7 +1266,20 @@ struct SamplerMemo {
   }
 };
 SamplerMemo samplerMemo;
-VkSampler sampler(const uint32_t *words, bool compare, bool integer, bool allowAniso, bool linearSupported) {
+SamplerSlotMemo<VkDevice,VkSampler,LATTE_NUM_MAX_TEX_UNITS*2> samplerSlots;
+SamplerLookupStats samplerLookupStats;
+int sampler_slot_mode() {
+ static const int mode=[] {const char* e=std::getenv("WWHD_VK_SAMPLER_SLOTS");return e && !std::strcmp(e,"verify")?2:e && !std::strcmp(e,"optimized")?1:0;}();
+ return mode;
+}
+std::string legacy_sampler_key(const uint32_t* words,bool compare,bool integer,bool aniso,bool nearest) {
+ std::string key(reinterpret_cast<const char*>(words),12);
+ key.push_back(compare);key.push_back(integer);key.push_back(aniso);key.push_back(nearest);
+ return key;
+}
+auto& sampler_map() {static std::unordered_map<std::string,VkSampler> cache;return cache;}
+VkSampler sampler(const uint32_t *words, bool compare, bool integer, bool allowAniso, bool linearSupported,
+                  uint32_t slot,int mode) {
   const bool nearestOnly = sampler_nearest_only(integer, compare, linearSupported);
   static const bool memo = [] {
     const char* e = std::getenv("WWHD_VK_SAMPLER_MEMO");
@@ -1236,21 +1288,38 @@ VkSampler sampler(const uint32_t *words, bool compare, bool integer, bool allowA
   const bool forceAniso = allowAniso && aniso_enabled();
   const bool stats = preparation_stats_enabled();
   if (stats) ++R.cpuPreparation.samplerRequests;
+  ++samplerLookupStats.requests;
   if (memo && samplerMemo.matches(R.device, words, compare, integer, forceAniso, nearestOnly)) {
     if (stats) ++R.cpuPreparation.samplerMemoHits;
+    ++samplerLookupStats.lastHits;
     return samplerMemo.value;
   }
+  SamplerSlotKey slotKey;
+  if(mode && memo) {
+    slotKey=SamplerSlotKey::make(words,compare,integer,forceAniso,nearestOnly);
+    ++samplerLookupStats.slotChecks;
+    if(auto value=samplerSlots.find(R.device,slot,slotKey)) {
+      ++samplerLookupStats.slotHits;
+      if(mode==2) {
+        const auto key=legacy_sampler_key(words,compare,integer,forceAniso,nearestOnly);
+        auto& cache=sampler_map();auto found=cache.find(key);
+        if(found==cache.end() || found->second!=value)
+          exception_report::raise("sampler slot memo differs from original map");
+        ++samplerLookupStats.verified;
+      }
+      samplerMemo.remember(R.device,words,compare,integer,forceAniso,nearestOnly,value);
+      return value;
+    }
+  }
   if (stats) ++R.cpuPreparation.samplerMapLookups;
+  ++samplerLookupStats.mapLookups;
   auto remember = [&](VkSampler value) {
+    if(mode && memo)samplerSlots.remember(R.device,slot,slotKey,value);
     if (memo) samplerMemo.remember(R.device, words, compare, integer, forceAniso, nearestOnly, value);
     return value;
   };
-  std::string key(reinterpret_cast<const char *>(words), 12);
-  key.push_back(compare);
-  key.push_back(integer);
-  key.push_back(forceAniso);
-  key.push_back(nearestOnly);
-  static std::unordered_map<std::string, VkSampler> cache;
+  auto key=legacy_sampler_key(words,compare,integer,forceAniso,nearestOnly);
+  auto& cache=sampler_map();
   if (auto it = cache.find(key); it != cache.end())
     return remember(it->second);
   LATTE_SQ_TEX_SAMPLER_WORD0_0 w;
@@ -1630,7 +1699,15 @@ VkImageView feedback_view(Surface *source, const uint32_t *textureWords,
   }
   static const bool reuse = [] {
     const char* e = std::getenv("WWHD_VK_REUSE_FEEDBACK_IMAGES");
-    return e && !std::strcmp(e, "1");
+      if (e) return !std::strcmp(e, "1");
+#ifdef WWHD_UWP
+      // Avoid allocating and retiring attachment snapshots every frame on
+      // Dozen. The retained images use the same copies and queue barriers;
+      // compatibility checks and the memory budget still apply below.
+      return true;
+#else
+      return false;
+#endif
   }();
   Surface temporary;
   Surface* copy = &temporary;
@@ -1747,11 +1824,231 @@ VkImageView feedback_view(Surface *source, const uint32_t *textureWords,
   destroy_surface_image(&temporary); // Temporary snapshots remain fence-retired.
   return view;
 }
+// ---------------------------------------------------------------- continued-draw fast path
+// On by default (WWHD_VK_FASTPATH=0 turns it off): while only "continued" register groups changed since the previous resolved
+// draw (gx2/state_groups.h: ALU constants, uniform-block and vertex-buffer pointers, per-draw
+// dynamic words), in the same frame and surface epoch (backend.h), with the same primitive type and
+// graphics settings, a draw reuses that draw's fetch/vertex/pixel shaders, render targets, pipeline
+// and texture/sampler bindings (Cemu's continued draw pass: LatteCommandProcessor.cpp,
+// VulkanRendererCore.cpp). Uniforms, support uniforms (incl. texture scales), descriptor sets,
+// indices, vertex buffers and dynamic state are still prepared per draw, and every reused texture
+// still goes through upload_surface (write tracking/invalidations): an upload ends the epoch and the
+// draw resolves fully. Draws that sample one of their own targets' addresses (feedback loops and
+// lookups whose winner can change with the target's write sequence), AO replays and AO-substituted
+// textures are never continued.
+// WWHD_VK_FASTPATH_VERIFY=N (unless WWHD_VK_FASTPATH=0): on every Nth continued draw
+// also run the full resolution, compare shaders, targets, pipeline and texture/sampler bindings,
+// count and log mismatches (the draw then uses the full result). Statistics every 120 frames.
+struct FastPathConfig {
+  bool on = false;
+  uint32_t verifyEvery = 0;
+};
+const FastPathConfig& fastpath_config() {
+  static const FastPathConfig config = [] {
+    FastPathConfig c;
+    if (const char* v = std::getenv("WWHD_VK_FASTPATH_VERIFY")) c.verifyEvery = uint32_t(std::max(0, std::atoi(v)));
+    const char* e = std::getenv("WWHD_VK_FASTPATH");
+    c.on = e ? std::atoi(e) != 0 : true;
+    if (!c.on) c.verifyEvery = 0;
+    LOG("[vulkan] continued-draw fast path %s%s", c.on ? "on" : "off (WWHD_VK_FASTPATH=0)", c.verifyEvery ? " (verify mode)" : "");
+    return c;
+  }();
+  return config;
+}
+struct ContinuedTexture {
+  uint32_t unit = 0;
+  int binding = -1;
+  Surface* surface = nullptr;
+  VkImageView view = VK_NULL_HANDLE;
+  VkSampler sampler = VK_NULL_HANDLE;
+};
+struct ContinuedStage {
+  uint32_t count = 0;
+  bool continuable = true;
+  std::array<ContinuedTexture, LATTE_NUM_MAX_TEX_UNITS> textures{};
+  void add(const ContinuedTexture& t) {
+    if (count < textures.size()) textures[count++] = t;
+    else continuable = false;
+  }
+};
+struct DrawTargets {
+  std::array<Surface*, 8> colors{};
+  std::array<uint32_t, 8> slices{};
+  Surface* depth = nullptr;
+  Surface* target = nullptr;  // first colour target, else depth (before AO replay drops a mismatch)
+  uint32_t depthSlice = 0, width = 0, height = 0;
+  float sx = 1, sy = 1;
+  bool same(const DrawTargets& o) const {
+    return colors == o.colors && slices == o.slices && depth == o.depth && target == o.target && depthSlice == o.depthSlice &&
+           width == o.width && height == o.height && !std::memcmp(&sx, &o.sx, 4) && !std::memcmp(&sy, &o.sy, 4);
+  }
+};
+enum ContinuedReason : uint8_t {
+  kContinued, kNoState, kNewFrame, kRegisters, kSurfaces, kUpload, kPrimitive, kSettings,
+  kVerifyMismatch, kNotContinuable, kAoReplay, kReasons
+};
+const char* const continuedReasonNames[kReasons] = {
+  "continued", "no state", "new frame", "registers", "surfaces", "texture upload", "primitive",
+  "settings", "verify mismatch", "not continuable", "AO replay"};
+struct ContinuedDraw {
+  bool valid = false;
+  ContinuedReason invalidReason = kNoState;  // why the state is not valid
+  uint64_t stateVersion = 0, surfaceEpoch = 0, frame = ~uint64_t{0};
+  uint32_t prim = 0;
+  VkPrimitiveTopology topology = VK_PRIMITIVE_TOPOLOGY_MAX_ENUM;
+  int aoMode = 0;
+  bool aoHires = false, aniso = false;
+  LatteFetchShader* fs = nullptr;
+  uint64_t fsKey = 0;
+  vk::Shader *vs = nullptr, *ps = nullptr;
+  DrawTargets targets;
+  Pipeline* pipeline = nullptr;
+  ContinuedStage stages[2];
+};
+ContinuedDraw continued;
+struct ContinuedStats {
+  uint64_t lastFrame = 0, draws = 0, verified = 0, mismatches = 0, totalMismatches = 0, totalVerified = 0;
+  std::array<uint64_t, kReasons> reasons{};
+  std::array<uint64_t, gx2::kSgCount> groups{};  // register groups that ended a continuation
+  std::array<uint64_t, 8> mismatchKinds{};
+} continuedStats;
+const char* const mismatchKindNames[8] = {"fetch shader", "vertex shader", "pixel shader", "targets",
+                                          "pipeline", "texture count", "texture binding", "topology"};
+void report_continued_stats() {
+  auto& st = continuedStats;
+  if (R.frame < st.lastFrame + 120) return;
+  const double frames = double(R.frame - st.lastFrame);
+  if (st.draws) {
+    char buf[1024];
+    int k = std::snprintf(buf, sizeof buf, "[vulkan fastpath] frame %llu: %.1f%% of %.0f draws/frame continued; full:",
+                          (unsigned long long)R.frame, 100.0 * st.reasons[kContinued] / st.draws, st.draws / frames);
+    for (int i = 1; i < kReasons && k < int(sizeof buf); ++i)
+      if (st.reasons[i]) k += std::snprintf(buf + k, sizeof buf - k, " %s %.1f%%", continuedReasonNames[i], 100.0 * st.reasons[i] / st.draws);
+    if (st.reasons[kRegisters] && k < int(sizeof buf)) {
+      k += std::snprintf(buf + k, sizeof buf - k, "; groups/frame:");
+      for (int g = 0; g < gx2::kSgCount && k < int(sizeof buf); ++g)
+        if (st.groups[g]) k += std::snprintf(buf + k, sizeof buf - k, " %s %.0f", gx2::state_group_name(g), st.groups[g] / frames);
+    }
+    if (fastpath_config().verifyEvery && k < int(sizeof buf))
+      k += std::snprintf(buf + k, sizeof buf - k, "; verify: %llu checked, %llu mismatches (total %llu of %llu)",
+                         (unsigned long long)st.verified, (unsigned long long)st.mismatches,
+                         (unsigned long long)st.totalMismatches, (unsigned long long)st.totalVerified);
+    LOG("%s", buf);
+  }
+  const uint64_t totalMismatches = st.totalMismatches, totalVerified = st.totalVerified;
+  const auto kinds = st.mismatchKinds;
+  st = {};
+  st.lastFrame = R.frame;
+  st.totalMismatches = totalMismatches;
+  st.totalVerified = totalVerified;
+  st.mismatchKinds = kinds;
+}
+// Render targets of a draw (both paths); false: the draw has no target.
+bool resolve_targets(const uint32_t* r, vk::Shader* ps, DrawTargets& t) {
+  t = {};
+  const auto &lcr = *reinterpret_cast<const LatteContextRegister *>(r);
+  auto mask = LatteMRT::GetActiveColorBufferMask(ps->dec, lcr);
+  for (int i = 0; i < 8; i++)
+    if (mask & (1 << i))
+      t.colors[i] = color_target(r, i, &t.slices[i]);
+  t.depth = LatteMRT::GetActiveDepthBufferMask(lcr) ? depth_target(r, &t.depthSlice) : nullptr;
+  if (t.depth && t.depth->width == 1280 && t.depth->height == 720) R.mainDepthAddr = t.depth->addr;
+  auto& colors = t.colors;
+  auto& depth = t.depth;
+  const uint32_t guestWidth = colors[0] ? colors[0]->width : 0;
+  const uint32_t guestHeight = colors[0] ? colors[0]->height : 0;
+  if (aoPrivateReplay && colors[0]) {
+    aoPrivateSource = colors[0]->addr;
+    colors[0] = private_ao_surface(aoPrivateColor, colors[0]);
+    t.slices[0] = 0;
+    if (depth) {
+      depth = private_ao_surface(aoPrivateDepth, depth);
+      t.depthSlice = 0;
+    }
+  }
+  Surface *target = depth;
+  for (auto *c : colors)
+    if (c) {
+      target = c;
+      break;
+    }
+  if (!target)
+    return false;
+  t.target = target;
+  t.width = target->extent.width;
+  t.height = target->extent.height;
+  t.sx = target->sx;
+  t.sy = target->sy;
+  if (aoPrivateReplay && guestWidth) {
+    // the viewport registers describe the game's smaller buffer (x and y differ at other aspect ratios)
+    t.sx = float(colors[0]->extent.width) / guestWidth;
+    t.sy = guestHeight ? float(colors[0]->extent.height) / guestHeight : t.sx;
+  }
+  for (auto *&c : colors)
+    if (c && (c->extent.width != t.width || c->extent.height != t.height)) {
+      if (aoPrivateReplay) c = nullptr;
+      else exception_report::raise("mismatched Vulkan attachments");
+    }
+  if (depth && (depth->extent.width < t.width || depth->extent.height < t.height))
+    depth = nullptr;
+  return true;
+}
+// A sampled texture of a stage (both paths): lookup, AO substitution and the write-tracking check.
+// substituted: the private AO image replaced the guest texture.
+Surface* resolve_texture(const uint32_t* r, vk::Shader* sh, uint32_t unit, bool* substituted = nullptr) {
+  const uint32_t texbase = sh->vertex ? REGADDR::SQ_TEX_RESOURCE_WORD0_N_VS : REGADDR::SQ_TEX_RESOURCE_WORD0_N_PS;
+  auto *s = sampled_texture(r + texbase + unit * 7, sh->dec->textureUsesDepthCompare[unit]);
+  if (!s)
+    exception_report::raise("missing sampled texture");
+  if (!sh->vertex && ao_hires_enabled() && aoPrivateSource &&
+      s->addr == aoPrivateSource && aoPrivateFrame == R.frame &&
+      sh->kind == gfx::ProgramKind::OcclusionPixel) {
+    s = &aoPrivateColor;
+    if (substituted) *substituted = true;
+  }
+  upload_surface(s);
+  return s;
+}
+bool aliases_target(const Surface* s, const std::array<Surface*, 8>& colors, const Surface* depth) {
+  bool aliases = depth && s->image == depth->image;
+  for (auto *color : colors)
+    if (color && s->image == color->image)
+      aliases = true;
+  return aliases;
+}
+// a lookup at one of the draw's own target addresses can pick another surface once the target's
+// write sequence advances (find_or_create_surface): such textures are not continued
+bool shares_target_address(const Surface* s, const std::array<Surface*, 8>& colors, const Surface* depth) {
+  if (depth && depth->addr == s->addr) return true;
+  for (auto *color : colors)
+    if (color && color->addr == s->addr) return true;
+  return false;
+}
+VkSampler resolve_sampler(const uint32_t* r, vk::Shader* sh, uint32_t unit, const Surface* s) {
+  uint32_t samplerId = sh->dec->textureUnitSamplerAssignment[unit];
+  if (samplerId >= 18)
+    exception_report::raise("missing texture sampler");
+  uint32_t samplerBase = sh->vertex ? 18 : 0;
+  const uint32_t* samplerWords = r + REGADDR::SQ_TEX_SAMPLER_WORD0_0 +
+                                  (samplerBase + samplerId) * 3;
+  uint32_t patchedSampler[3];
+  if (!sh->vertex && ao_mode() >= 1 && unit == 0 &&
+      sh->kind == gfx::ProgramKind::OcclusionPixel) {
+    memcpy(patchedSampler, samplerWords, sizeof patchedSampler);
+    patchedSampler[0] = (patchedSampler[0] & ~0x7E00u) | (1u << 9) | (1u << 12);
+    samplerWords = patchedSampler;
+  }
+  return sampler(samplerWords, sh->dec->textureUsesDepthCompare[unit],
+                 s->fmt.kind != FormatInfo::FLOAT,
+                 !s->gpuWritten && s->mips > 1, s->linearFiltering,
+                 (sh->vertex?LATTE_NUM_MAX_TEX_UNITS:0)+unit,sampler_slot_mode());
+}
 StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
                           VkDescriptorSetLayout layout, bool dynamicUniforms, float sx, float sy,
                           const std::array<Surface *, 8> &colors,
                           Surface *depth, FeedbackStatsProbe* feedbackProbe, float eyeOffset = 0,
-                          bool sunShadow = false) {
+                          bool sunShadow = false,
+                          const ContinuedStage* reuse = nullptr, ContinuedStage* record = nullptr) {
   StageResources out;
   auto &m = sh->mapping;
   // Descriptor info pointers must remain stable until this stage's one update.
@@ -1808,14 +2105,20 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
       return snapshot(source, length, R.properties.limits.minUniformBufferOffsetAlignment);
     };
     UploadSlice cachedSlice;
-    const bool cached = guestAddr && buffer_cache_enabled() &&
-        cached_guest_range(guestAddr, uint32_t(size), rprof::kUpUbo, cachedSlice);
-    const auto b = cached ? cachedSlice
-        : reuseUniforms
-        ? uniformCache.get(R.device, R.submissionGeneration,
-                           (sh->vertex ? 0 : 17) + logicalSlot, bytes, size,
-                           R.uploadReadsDirect, fresh)
-        : fresh(bytes, size);
+    bool cached=false;
+    if(guestAddr && buffer_cache_enabled()) {
+      UniformComponentTimer timing(1);
+      cached=cached_guest_range(guestAddr,uint32_t(size),rprof::kUpUbo,cachedSlice);
+    }
+    UploadSlice b=cachedSlice;
+    if(!cached) {
+      UniformComponentTimer timing(2);
+      b=reuseUniforms
+          ? uniformCache.get(R.device, R.submissionGeneration,
+                             (sh->vertex ? 0 : 17) + logicalSlot, bytes, size,
+                             R.uploadReadsDirect, fresh)
+          : fresh(bytes, size);
+    }
     if (reuseUniforms && preparation_stats_enabled()) {
       const auto& counts = uniformCache.counters;
       R.cpuPreparation.uniformReuseChecks = counts.checks;
@@ -1850,7 +2153,10 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
   auto& supportUniforms = supportScratch[sh->vertex ? 0 : 1];
   if (m.uniformVarsBufferBindingPoint >= 0) {
     const size_t capacity=preparation_stats_enabled()?supportUniforms.capacity():0;
-    vk::pack_uniforms_into(r, *sh, supportUniforms, sx, sy, eyeOffset, stereo::frame.convergence);
+    {
+      UniformComponentTimer timing(0);
+      vk::pack_uniforms_cached_into(r, *sh, supportUniforms, sx, sy, eyeOffset, stereo::frame.convergence);
+    }
     if(preparation_stats_enabled()) {
       ++R.cpuPreparation.packCalls;
       R.cpuPreparation.packBytes+=supportUniforms.size();
@@ -1903,6 +2209,35 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
   rprof::mark(rprof::kUniforms);
   uint32_t texbase = sh->vertex ? REGADDR::SQ_TEX_RESOURCE_WORD0_N_VS
                                 : REGADDR::SQ_TEX_RESOURCE_WORD0_N_PS;
+  auto bindTexture = [&](uint32_t unit, int binding, Surface* s, VkImageView view, VkSampler samplerValue) {
+    int scaleOffset = sh->uniforms.offset_texScale[unit];
+    if (scaleOffset >= 0 && size_t(scaleOffset) + 8 <= supportUniforms.size()) {
+      const float scale[] = {s->sx, s->sy};
+      memcpy(supportUniforms.data() + scaleOffset, scale, sizeof scale);
+    }
+    if (imageCount >= imageInfos.size())
+      exception_report::raise("stage image descriptor capacity exceeded");
+    auto &info = imageInfos[imageCount++];
+    info = {samplerValue, view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    auto &write = appendWrite(rankPlan.textures[unit]);
+    write.dstBinding = binding;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    write.pImageInfo = &info;
+  };
+  if (reuse) {
+    // continued draw: the previous draw's textures (upload_surface already ran for this draw)
+    for (uint32_t i = 0; i < reuse->count; ++i) {
+      const auto& t = reuse->textures[i];
+      transition_image(t.surface, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                       narrow_barriers()
+                           ? (sh->vertex ? VK_PIPELINE_STAGE_VERTEX_SHADER_BIT
+                                         : VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT)
+                           : (VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                              VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT),
+                       VK_ACCESS_SHADER_READ_BIT);
+      bindTexture(t.unit, t.binding, t.surface, t.view, t.sampler);
+    }
+  } else
   for (int i = 0; i < sh->dec->textureUnitListCount; i++) {
     uint32_t unit = sh->dec->textureUnitList[i];
     if (unit >= LATTE_NUM_MAX_TEX_UNITS)
@@ -1910,24 +2245,14 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
     int binding = m.textureUnitToBindingPoint[unit];
     if (binding < 0)
       continue;
-    auto *s = sampled_texture(r + texbase + unit * 7,
-                              sh->dec->textureUsesDepthCompare[unit]);
-    if (!s)
-      exception_report::raise("missing sampled texture");
-    if (!sh->vertex && ao_hires_enabled() && aoPrivateSource &&
-        s->addr == aoPrivateSource && aoPrivateFrame == R.frame &&
-        sh->kind == gfx::ProgramKind::OcclusionPixel)
-      s = &aoPrivateColor;
-    upload_surface(s);
+    bool substituted = false;
+    Surface* s = resolve_texture(r, sh, unit, &substituted);
+    bool aliases = aliases_target(s, colors, depth);
     int scaleOffset = sh->uniforms.offset_texScale[unit];
     if (scaleOffset >= 0 && size_t(scaleOffset) + 8 <= supportUniforms.size()) {
       const float scale[] = {s->sx, s->sy};
       memcpy(supportUniforms.data() + scaleOffset, scale, sizeof scale);
     }
-    bool aliases = depth && s->image == depth->image;
-    for (auto *color : colors)
-      if (color && s->image == color->image)
-        aliases = true;
     VkImageView sampledView =
         aliases ? feedback_view(s, r + texbase + unit * 7, sh->vertex, unit, feedbackProbe)
                 : sampled_texture_view(s, r + texbase + unit * 7);
@@ -1939,31 +2264,12 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
                            : (VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
                               VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT),
                        VK_ACCESS_SHADER_READ_BIT);
-    uint32_t samplerId = sh->dec->textureUnitSamplerAssignment[unit];
-    if (samplerId >= 18)
-      exception_report::raise("missing texture sampler");
-    uint32_t samplerBase = sh->vertex ? 18 : 0;
-    if (imageCount >= imageInfos.size())
-      exception_report::raise("stage image descriptor capacity exceeded");
-    auto &info = imageInfos[imageCount++];
-    const uint32_t* samplerWords = r + REGADDR::SQ_TEX_SAMPLER_WORD0_0 +
-                                    (samplerBase + samplerId) * 3;
-    uint32_t patchedSampler[3];
-    if (!sh->vertex && ao_mode() >= 1 && unit == 0 &&
-        sh->kind == gfx::ProgramKind::OcclusionPixel) {
-      memcpy(patchedSampler, samplerWords, sizeof patchedSampler);
-      patchedSampler[0] = (patchedSampler[0] & ~0x7E00u) | (1u << 9) | (1u << 12);
-      samplerWords = patchedSampler;
+    VkSampler samplerValue = resolve_sampler(r, sh, unit, s);
+    bindTexture(unit, binding, s, sampledView, samplerValue);
+    if (record) {
+      if (aliases || substituted || shares_target_address(s, colors, depth)) record->continuable = false;
+      record->add({unit, binding, s, sampledView, samplerValue});
     }
-    info = {sampler(samplerWords, sh->dec->textureUsesDepthCompare[unit],
-                   s->fmt.kind != FormatInfo::FLOAT,
-                   !s->gpuWritten && s->mips > 1, s->linearFiltering),
-                             sampledView,
-                             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
-    auto &write = appendWrite(rankPlan.textures[unit]);
-    write.dstBinding = binding;
-    write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    write.pImageInfo = &info;
   }
   rprof::mark(rprof::kTextures);
   if (m.uniformVarsBufferBindingPoint >= 0)
@@ -2026,6 +2332,75 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
   remember_descriptors(last, layout, out.set, writes.data(), writeCount);
   return out;
 }
+// WWHD_VK_FASTPATH_VERIFY: the full resolution of a continued draw, compared with the reused state
+bool verify_continued(const uint32_t* r, uint32_t prim) {
+  const auto& c = continued;
+  int kind = -1;
+  char detail[200] = "";
+  uint64_t fsKey = 0;
+  auto* fs = vk::get_fetch_shader(r, &fsKey, R.frame);
+  vk::Shader* vs = fs ? vk::translate(r, true, fs, fsKey, R.frame, g_shader_state_gen) : nullptr;
+  vk::Shader* ps = fs ? vk::translate(r, false, fs, fsKey, R.frame, g_shader_state_gen,
+                                     vs && vs->ready() ? vs : nullptr) : nullptr;
+  DrawTargets t;
+  if (fs != c.fs || fsKey != c.fsKey) kind = 0;
+  else if (vs != c.vs || !vs || !vs->ready()) kind = 1;
+  else if (ps != c.ps || !ps || !ps->ready()) kind = 2;
+  else if (primitive_topology(prim) != c.topology) kind = 7;
+  else if (!resolve_targets(r, ps, t) || !t.same(c.targets)) kind = 3;
+  else if (&pipeline(r, vs, ps, fs, c.topology, t.colors, t.depth) != c.pipeline) kind = 4;
+  else
+    for (int stage = 0; stage < 2 && kind < 0; ++stage) {
+      vk::Shader* sh = stage ? ps : vs;
+      const auto& cs = c.stages[stage];
+      const uint32_t texbase = sh->vertex ? REGADDR::SQ_TEX_RESOURCE_WORD0_N_VS : REGADDR::SQ_TEX_RESOURCE_WORD0_N_PS;
+      uint32_t n = 0;
+      for (int i = 0; i < sh->dec->textureUnitListCount && kind < 0; i++) {
+        const uint32_t unit = sh->dec->textureUnitList[i];
+        if (unit >= LATTE_NUM_MAX_TEX_UNITS) { kind = 6; break; }
+        const int binding = sh->mapping.textureUnitToBindingPoint[unit];
+        if (binding < 0) continue;
+        if (n >= cs.count) { kind = 5; break; }
+        const auto& e = cs.textures[n++];
+        Surface* s = resolve_texture(r, sh, unit);
+        const bool aliases = aliases_target(s, t.colors, t.depth);
+        VkImageView view = aliases ? VK_NULL_HANDLE : sampled_texture_view(s, r + texbase + unit * 7);
+        VkSampler smp = resolve_sampler(r, sh, unit, s);
+        if (e.unit != unit || e.binding != binding || e.surface != s || aliases || view != e.view || smp != e.sampler) {
+          kind = 6;
+          std::snprintf(detail, sizeof detail, " (%s unit %u: surface %08X%s/%08X, view %s, sampler %s%s)",
+                        stage ? "ps" : "vs", unit, s->addr, e.surface == s ? "" : " (cached differs)",
+                        e.surface ? e.surface->addr : 0, view == e.view ? "same" : "differs",
+                        smp == e.sampler ? "same" : "differs", aliases ? ", aliases a target" : "");
+        }
+      }
+      if (kind < 0 && n != cs.count) kind = 5;
+    }
+  if (kind < 0) return true;
+  auto& st = continuedStats;
+  ++st.mismatches;
+  ++st.totalMismatches;
+  ++st.mismatchKinds[kind];
+  static int logged = 0;
+  if (logged < 50) {
+    ++logged;
+    LOG("[vulkan fastpath] verify mismatch #%llu: %s%s; frame %llu draw %llu prim %u vs %08X ps %08X fs %08X",
+        (unsigned long long)st.totalMismatches, mismatchKindNames[kind], detail, (unsigned long long)R.frame,
+        (unsigned long long)R.drawCount, prim, r[mmSQ_PGM_START_VS] << 8, r[mmSQ_PGM_START_PS] << 8,
+        r[mmSQ_PGM_START_FS] << 8);
+  }
+  return false;
+}
+ContinuedReason continued_reason(uint32_t prim) {
+  const auto& c = continued;
+  if (!c.valid) return c.invalidReason;
+  if (c.frame != R.frame) return kNewFrame;
+  if (c.stateVersion != gx2::g_full_state_version) return kRegisters;
+  if (c.surfaceEpoch != g_surface_epoch) return kSurfaces;
+  if (c.prim != prim) return kPrimitive;
+  if (c.aoMode != ao_mode() || c.aoHires != ao_hires_enabled() || c.aniso != aniso_enabled()) return kSettings;
+  return kContinued;
+}
 } // namespace
 VertexSnapshotCacheStats vertex_snapshot_associative_stats() { return associativeVertices.stats(); }
 UploadSlice vertex_snapshot_smoke_snapshot(uint32_t binding,uint32_t address,uint32_t size) {
@@ -2065,7 +2440,47 @@ void reset_ao_private_cache() { aoPrivateFrame = ~0ull; aoPrivateSource = 0; }
 void drain_pending_guest_pipelines() {
   for (auto& [key, value] : pipelines) resolve_pending_pipeline(value);
 }
-void reset_pipeline_lookup_cache() { lastPipelineLookup = {}; pipelineLookaside = {}; samplerMemo = {}; drawBatchState = {}; }
+void reset_pipeline_lookup_cache() { lastPipelineLookup = {}; pipelineLookaside = {}; samplerMemo = {}; samplerSlots.reset(); drawBatchState = {}; continued = {}; }
+void sampler_lookup_self_test() {
+  // Synthetic valid sampler states; all returned objects must be the SAME
+  // handles as the unchanged legacy map, not merely equivalent create infos.
+  const std::array<std::array<uint32_t,3>,4> states{{{{0,0,0}},{{2,0,0}},{{(1u<<9)|(1u<<12),0,0}},{{2u|(1u<<9)|(1u<<12),0,1}}}};
+  samplerMemo={};samplerSlots.reset();
+  for(unsigned i=0;i<256;++i) {
+    const uint32_t slot=i%(LATTE_NUM_MAX_TEX_UNITS*2);
+    const auto& words=states[(i/8+i)%states.size()];
+    const bool compare=(i&1)!=0,integer=(i&2)!=0,linear=(i&4)!=0;
+    auto value=sampler(words.data(),compare,integer,false,linear,slot,2);
+    const auto key=legacy_sampler_key(words.data(),compare,integer,false,sampler_nearest_only(integer,compare,linear));
+    auto found=sampler_map().find(key);
+    if(found==sampler_map().end() || found->second!=value)exception_report::raise("sampler slot smoke differs from original object");
+  }
+  // Warm both algorithms on alternating units. Same actual production lookup,
+  // six interleaved rounds; this kernel is NOT a game FPS benchmark.
+  std::array<std::vector<double>,2> times;
+  for(unsigned round=0;round<6;++round)for(unsigned order=0;order<2;++order) {
+    const unsigned mode=(round+order)&1;
+    samplerMemo={};samplerSlots.reset();
+    VkSampler last=VK_NULL_HANDLE;
+    const auto start=std::chrono::steady_clock::now();
+    for(unsigned n=0;n<32768;++n) {
+      const uint32_t unit=n%4;
+      const auto& words=states[unit^(((n/32)&1)*2)];
+      last=sampler(words.data(),false,false,false,true,unit,int(mode));
+    }
+    const double ns=std::chrono::duration<double,std::nano>(std::chrono::steady_clock::now()-start).count()/32768;
+    if(!last)exception_report::raise("sampler lookup kernel returned null");
+    times[mode].push_back(ns);
+  }
+  for(auto& values:times)std::sort(values.begin(),values.end());
+  fprintf(stderr,"[sampler lookup kernel] alternating units, legacy %.1f ns/request; slot memo %.1f ns/request; six interleaved rounds; actual production lookup, NOT game FPS\n",
+          (times[0][2]+times[0][3])/2,(times[1][2]+times[1][3])/2);
+  samplerMemo={};samplerSlots.reset();
+  fprintf(stderr,"[renderer smoke] sampler slot memo: exact legacy handles, flags/stage/unit variations and real-device lookup kernel passed\n");
+}
+SamplerLookupStats sampler_lookup_stats() {return samplerLookupStats;}
+IndexMemoStats index_conversion_memo_stats() {return indexConversionMemo.stats();}
+uint64_t cached_window_checks() {return cachedWindowChecks;}
 uint64_t draw_batch_submissions() { return drawBatchSubmissions; }
 // WWHD_VK_TRACE_PASSES=1 (issue #144): log each new render pass shape once, just before the driver
 // sees it, so a crash inside vkCmdBeginRendering names the last pass in the crash report's log lines
@@ -2111,18 +2526,60 @@ void draw_stereo(const uint32_t *r,uint32_t prim,uint32_t count,uint32_t indexTy
 }
 void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
           uint32_t indexAddr, uint32_t baseVertex, uint32_t instances, bool* viewIndependent) {
+  const uint32_t dirtyGroups = gx2::take_dirty_groups();  // register groups changed since the previous draw
   if (!count || !instances || ((prim == 0x13 || prim == 0x14) && count < 4))
     return;
   if (r[REGADDR::PA_CL_CLIP_CNTL] & (1 << 22))
     return;
   ((uint32_t *)r)[REGADDR::VGT_PRIMITIVE_TYPE] = prim;
+  // continued-draw fast path (see fastpath_config); the AO replay draw stays outside of it
+  const auto& fastPath = fastpath_config();
+  const bool fastPathDraw = fastPath.on && !aoPrivateReplay;
+  bool fast = false;
+  if (fastPathDraw) {
+    report_continued_stats();
+    ContinuedReason reason = continued_reason(prim);
+    if (reason == kContinued) {
+      // guest writes to the reused textures (write tracking, GX2Invalidate) upload here; an upload
+      // can change lookups, so it ends the continuation
+      for (const auto& stage : continued.stages)
+        for (uint32_t i = 0; i < stage.count; ++i) upload_surface(stage.textures[i].surface);
+      if (g_surface_epoch != continued.surfaceEpoch) reason = kUpload;
+    }
+    if (reason == kContinued && fastPath.verifyEvery) {
+      static uint64_t verifyCounter = 0;
+      if (++verifyCounter % fastPath.verifyEvery == 0) {
+        ++continuedStats.verified;
+        ++continuedStats.totalVerified;
+        if (!verify_continued(r, prim)) reason = kVerifyMismatch;
+      }
+    }
+    fast = reason == kContinued;
+    ++continuedStats.draws;
+    ++continuedStats.reasons[reason];
+    if (reason == kRegisters)
+      for (int g = 0; g < gx2::kSgCount; ++g)
+        if ((dirtyGroups & ~gx2::kSgContinuedMask) >> g & 1) ++continuedStats.groups[g];
+    // a full draw records a new state below; exceptions leave none
+    continued.valid = false;
+    continued.invalidReason = kNoState;
+  }
   uint64_t fsKey = 0;
-  auto *fs = vk::get_fetch_shader(r, &fsKey, R.frame);
-  if (!fs)
-    exception_report::raise("missing Vulkan fetch shader");
-  auto *vs = vk::translate(r, true, fs, fsKey, R.frame, g_shader_state_gen);
-  auto *ps = vk::translate(r, false, fs, fsKey, R.frame, g_shader_state_gen,
+  LatteFetchShader* fs;
+  vk::Shader *vs, *ps;
+  if (fast) {
+    fs = continued.fs;
+    fsKey = continued.fsKey;
+    vs = continued.vs;
+    ps = continued.ps;
+  } else {
+    fs = vk::get_fetch_shader(r, &fsKey, R.frame);
+    if (!fs)
+      exception_report::raise("missing Vulkan fetch shader");
+    vs = vk::translate(r, true, fs, fsKey, R.frame, g_shader_state_gen);
+    ps = vk::translate(r, false, fs, fsKey, R.frame, g_shader_state_gen,
                            vs && vs->ready() ? vs : nullptr);
+  }
   rprof::mark(rprof::kShader);
   if (!vs || !vs->ready() || !ps || !ps->ready())
     exception_report::raise("Vulkan shader translation failed: " +
@@ -2151,9 +2608,10 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
                        : !stripRestart || restartIndex == UINT32_MAX));
   // Draw uploads copy the converted bytes before the optional AO replay calls
   // draw again. Retain CPU capacity; queued GPU work owns separate arena slices.
-  static thread_local std::vector<uint32_t> indices;
-  indices.clear();
-  // Conversion emits a known number of indices. Allocate once rather than
+  static thread_local std::vector<uint32_t> indicesScratch;
+  indicesScratch.clear();
+  const std::vector<uint32_t>* processedIndices=&indicesScratch;
+  // Conversion emits a known number of indicesScratch. Allocate once rather than
   // repeatedly growing and copying the vector for every indexed draw.
   size_t convertedCount = indexAddr ? size_t(count) : 0;
   switch (prim) {
@@ -2178,7 +2636,7 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
   // keyed by everything the conversion reads; a hit skips the conversion.
   bufcache::Entry* convertedEntry = nullptr;
   bool convertedHit = false;
-  if (indexAddr && !nativeIndices && !guestWrap && buffer_cache_enabled() &&
+  if (indexAddr && !nativeIndices && !guestWrap && buffer_cache_indices_enabled() &&
       guestBytes <= (8u << 20) && uint64_t(indexAddr) + guestBytes <= 0x100000000ull) {
     const bufcache::Key key{indexAddr, bufcache::kIndexConverted,
         uint64_t(count) | uint64_t(prim & 0xff) << 32 | uint64_t(indexType & 0xff) << 40 |
@@ -2202,10 +2660,28 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
     case 6: topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP; break;
     default: exception_report::raise("unsupported Vulkan primitive");
     }
-    vk::convert_indices(indexAddr ? mem::ptr(indexAddr) : nullptr, prim, count,
-                        indexType, stripRestart, restartIndex, indices);
+    const std::vector<uint32_t>* memoIndices=nullptr;
+#ifdef WWHD_UWP
+    static const int indexMemoMode=[] {const char* e=std::getenv("WWHD_UWP_INDEX_MEMO");
+      return e&&!std::strcmp(e,"verify")?2:e&&!std::strcmp(e,"optimized")?1:0;}();
+    if(indexMemoMode && indexAddr && !buffer_cache_enabled() &&
+        (indexType==0 || indexType==1 || indexType==4 || indexType==9)) {
+      const uint64_t inputBytes=guestReads*((indexType==0 || indexType==4)?2:4);
+      const size_t outputWords=convertedCount?convertedCount:count;
+      if(inputBytes<=65536 && uint64_t(indexAddr)+inputBytes<=0x100000000ull) {
+        const IndexMemoKey key{indexAddr,uint32_t(inputBytes),prim,count,indexType,restartIndex,stripRestart};
+        memoIndices=indexConversionMemo.get(key,mem::ptr(indexAddr),outputWords,indexMemoMode==2,
+            [&](const void* input,std::vector<uint32_t>& output) {
+              vk::convert_indices(input,prim,count,indexType,stripRestart,restartIndex,output);
+            });
+      }
+    }
+#endif
+    if(memoIndices)processedIndices=memoIndices;
+    else vk::convert_indices(indexAddr ? mem::ptr(indexAddr) : nullptr, prim, count,
+                        indexType, stripRestart, restartIndex, indicesScratch);
   } else {
-  if (!nativeIndices) indices.reserve(convertedCount);
+  if (!nativeIndices) indicesScratch.reserve(convertedCount);
   auto idx = [&](uint32_t i) {
     if (!indexAddr)
       return i;
@@ -2246,7 +2722,7 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
   case 5:
     topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     for (uint32_t i = 1; i + 1 < count; i++)
-      indices.insert(indices.end(), {idx(0), idx(i), idx(i + 1)});
+      indicesScratch.insert(indicesScratch.end(), {idx(0), idx(i), idx(i + 1)});
     break;
   case 6:
     topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
@@ -2254,30 +2730,31 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
   case 0x13:
     topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     for (uint32_t i = 0; i + 3 < count; i += 4)
-      indices.insert(indices.end(), {idx(i), idx(i + 1), idx(i + 2), idx(i),
+      indicesScratch.insert(indicesScratch.end(), {idx(i), idx(i + 1), idx(i + 2), idx(i),
                                      idx(i + 2), idx(i + 3)});
     break;
   case 0x14:
     topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     for (uint32_t i = 0; i + 3 < count; i += 2)
-      indices.insert(indices.end(), {idx(i), idx(i + 1), idx(i + 2), idx(i + 1),
+      indicesScratch.insert(indicesScratch.end(), {idx(i), idx(i + 1), idx(i + 2), idx(i + 1),
                                      idx(i + 3), idx(i + 2)});
     break;
   case 0x12:
     topology = VK_PRIMITIVE_TOPOLOGY_LINE_STRIP;
     for (uint32_t i = 0; i < count; i++)
-      indices.push_back(idx(i));
-    indices.push_back(idx(0));
+      indicesScratch.push_back(idx(i));
+    indicesScratch.push_back(idx(0));
     break;
   default:
     exception_report::raise("unsupported Vulkan primitive");
   }
-  if (!nativeIndices && indices.empty() && indexAddr) {
-    indices.resize(count);
+  if (!nativeIndices && indicesScratch.empty() && indexAddr) {
+    indicesScratch.resize(count);
     for (uint32_t i = 0; i < count; i++)
-      indices[i] = idx(i);
+      indicesScratch[i] = idx(i);
   }
   }
+  const auto& indices=*processedIndices;
   if (convertedEntry) {
     const bool hostStrip = topology == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP ||
                            topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
@@ -2297,52 +2774,17 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
     }
   }
   rprof::mark(rprof::kIndices);
-  const auto &lcr = *reinterpret_cast<const LatteContextRegister *>(r);
-  std::array<Surface *, 8> colors{};
-  uint32_t slices[8]{}, depthSlice = 0;
-  auto mask = LatteMRT::GetActiveColorBufferMask(ps->dec, lcr);
-  for (int i = 0; i < 8; i++)
-    if (mask & (1 << i))
-      colors[i] = color_target(r, i, &slices[i]);
-  Surface *depth = LatteMRT::GetActiveDepthBufferMask(lcr)
-                       ? depth_target(r, &depthSlice)
-                       : nullptr;
-  if (depth && depth->width == 1280 && depth->height == 720) R.mainDepthAddr = depth->addr;
-  const uint32_t guestWidth = colors[0] ? colors[0]->width : 0;
-  const uint32_t guestHeight = colors[0] ? colors[0]->height : 0;
-  if (aoPrivateReplay && colors[0]) {
-    aoPrivateSource = colors[0]->addr;
-    colors[0] = private_ao_surface(aoPrivateColor, colors[0]);
-    slices[0] = 0;
-    if (depth) {
-      depth = private_ao_surface(aoPrivateDepth, depth);
-      depthSlice = 0;
-    }
-  }
-  Surface *target = depth;
-  for (auto *c : colors)
-    if (c) {
-      target = c;
-      break;
-    }
-  if (!target)
+  DrawTargets targets;
+  if (fast) targets = continued.targets;
+  else if (!resolve_targets(r, ps, targets))
     return;
-  uint32_t width = target->extent.width, height = target->extent.height;
-  float sx = target->sx, sy = target->sy;
-  if (aoPrivateReplay && guestWidth) {
-    // the viewport registers describe the game's smaller buffer (x and y differ at other aspect ratios)
-    sx = float(colors[0]->extent.width) / guestWidth;
-    sy = guestHeight ? float(colors[0]->extent.height) / guestHeight : sx;
-  }
-  for (auto *&c : colors)
-    if (c && (c->extent.width != width || c->extent.height != height)) {
-      if (aoPrivateReplay) c = nullptr;
-      else exception_report::raise("mismatched Vulkan attachments");
-    }
-  if (depth && (depth->extent.width < width || depth->extent.height < height))
-    depth = nullptr;
+  auto& colors = targets.colors;
+  auto& slices = targets.slices;
+  Surface* depth = targets.depth;
+  const uint32_t depthSlice = targets.depthSlice, width = targets.width, height = targets.height;
+  const float sx = targets.sx, sy = targets.sy;
   rprof::mark(rprof::kTargets);
-  auto &p = pipeline(r, vs, ps, fs, topology, colors, depth);
+  auto &p = fast ? *continued.pipeline : pipeline(r, vs, ps, fs, topology, colors, depth);
   rprof::mark(rprof::kPipeline);
   if (!p.pipeline && !p.pendingCompile) return;
   if (p.pendingCompile && !begin_exact_preparation()) resolve_pending_pipeline(p);
@@ -2351,12 +2793,39 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
   if(vertex_window_stats_enabled()) report_vertex_window_stats();
   FeedbackStatsProbe feedbackProbe;
   auto* probe=feedback_stats_enabled()?&feedbackProbe:nullptr;
-  const float cameraEye = stereo::frame.mode != stereo::Off && stereo_screen_target(target->width,target->height)
+  const float cameraEye = stereo::frame.mode != stereo::Off && stereo_screen_target(targets.target->width,targets.target->height)
       ? (stereoEye ? 1.0f : -1.0f)*stereo::frame.depth*stereo::eyeDistanceAtUnitDepth : 0.0f;
   const bool sunShadow = ps->kind == gfx::ProgramKind::SunShadowMask;
-  auto vres = bind_stage(r, vs, p.sets[0], p.dynamicUniforms, sx, sy, colors, depth, probe, cameraEye,sunShadow);
+  const bool recordState = fastPathDraw && !fast;
+  if (recordState)
+    for (auto& stage : continued.stages) stage = {};
+  auto vres = bind_stage(r, vs, p.sets[0], p.dynamicUniforms, sx, sy, colors, depth, probe, cameraEye, sunShadow,
+                         fast ? &continued.stages[0] : nullptr, recordState ? &continued.stages[0] : nullptr);
   auto pres = bind_stage(r, ps, p.sets[1], p.dynamicUniforms, sx, sy, colors, depth, probe,
-      sunShadow ? cameraEye : 0,sunShadow);
+                         sunShadow ? cameraEye : 0, sunShadow,
+                         fast ? &continued.stages[1] : nullptr, recordState ? &continued.stages[1] : nullptr);
+  if (fastPathDraw) {
+    // the resolved state of this draw: continued by the next draws while nothing breaking changes
+    auto& c = continued;
+    c.valid = fast || (c.stages[0].continuable && c.stages[1].continuable);
+    c.invalidReason = kNotContinuable;
+    if (!fast) {
+      c.stateVersion = gx2::g_full_state_version;
+      c.surfaceEpoch = g_surface_epoch;
+      c.frame = R.frame;
+      c.prim = prim;
+      c.topology = topology;
+      c.aoMode = ao_mode();
+      c.aoHires = ao_hires_enabled();
+      c.aniso = aniso_enabled();
+      c.fs = fs;
+      c.fsKey = fsKey;
+      c.vs = vs;
+      c.ps = ps;
+      c.targets = targets;
+      c.pipeline = &p;
+    }
+  }
   // Texture uploads, feedback copies, and sampling transitions above may have
   // ended the previous pass. Reuse only its exact active attachment set.
   bool reusePass = R.rendering && R.passTracked && R.passColors == colors &&
@@ -2440,7 +2909,7 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
     ri.pColorAttachments = attachments.data();
     ri.pDepthAttachment = depth ? &da : nullptr;
     ri.pStencilAttachment = depth && depth->fmt.stencil ? &da : nullptr;
-    if(R.gpuPassTimestampsEnabled) gpu_begin_render_scope(colors,depth,slices,depthSlice,width,height);
+    if(R.gpuPassTimestampsEnabled) gpu_begin_render_scope(colors,depth,slices.data(),depthSlice,width,height);
     trace_pass(colors, ncolor, depth, depthSlice, width, height);
     begin_pass(cmd, ri, [&] {
       PassBegin pass; pass.formats.colorCount = ncolor;
@@ -2588,7 +3057,7 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
   if (nativeIndices) {
     const uint32_t indexBytes = indexType == 0 ? 2 : 4;
     bufcache::Entry* indexEntry = nullptr;
-    if (buffer_cache_enabled() && uint64_t(count) * indexBytes <= (8u << 20) &&
+    if (buffer_cache_indices_enabled() && uint64_t(count) * indexBytes <= (8u << 20) &&
         cached_native_indices(indexAddr, count * indexBytes, nativeIndexSlice, indexEntry)) {
       nativeIndexData = indexEntry->shadow.data();
       vertexExtent = cached_index_extent(*indexEntry, nativeIndexData, count, indexBytes,
@@ -2612,6 +3081,14 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
   } else if (convertedEntry) {
     vertexExtent = cached_index_extent(*convertedEntry, nullptr, convertedEntry->outSize / 4, 4,
                                        hostRestart, int32_t(baseVertex));
+    static const bool verifyWindow=[] {auto* e=std::getenv("WWHD_UWP_CACHED_WINDOW_VERIFY");return e&&!std::strcmp(e,"1");}();
+    if(verifyWindow && vertex_copy_window_enabled()) {
+      if(convertedEntry->shadow.size()!=convertedEntry->outSize)exception_report::raise("cached index window has no immutable CPU reference");
+      const auto reference=indexed_vertex_extent(convertedEntry->shadow.data(),convertedEntry->outSize/4,4,hostRestart,int32_t(baseVertex));
+      if(reference.valid!=vertexExtent.valid || (reference.valid && (reference.minimum!=vertexExtent.minimum || reference.maximum!=vertexExtent.maximum)))
+        exception_report::raise("cached index window extent differs from original scan");
+      ++cachedWindowChecks;
+    }
   } else if (!indices.empty()) {
     vertexExtent = indexed_vertex_extent(indices.data(), indices.size(), 4,
                                          hostRestart, int32_t(baseVertex));
@@ -2669,16 +3146,24 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
       t.prefix+=copied;t.window+=copied-unused;
     }
     R.vertexDeclaredBytes += size;
-    R.vertexCopiedBytes += copied;
-    rprof::guest_read(rprof::kUpVertex, addr, copied);
     const uint64_t windowBegin=uint64_t(extent.minimum)*stride;
     const uint64_t windowEnd=uint64_t(extent.maximum)*stride+attributeEnd;
     const bool copyWindow=vertex_copy_window_enabled() &&
-        (nativeIndices || !indices.empty()) && supported && rate &&
+        // A cached converted index stream is still indexed. Its immutable
+        // min/max memo supports the same reachable window without CPU readback.
+        (nativeIndices || convertedEntry || !indices.empty()) && supported && rate &&
         attributeEnd && stride && extent.valid && vertexExtent.valid &&
+        uint64_t(addr)+copied<=0x100000000ull &&
         windowEnd<=copied && windowBegin<windowEnd && windowBegin!=0;
+    const uint32_t initialized=copyWindow?uint32_t(windowEnd-windowBegin):copied;
+    R.vertexCopiedBytes += initialized;
+    rprof::guest_read(rprof::kUpVertex,copyWindow?addr+uint32_t(windowBegin):addr,initialized);
     UploadSlice b;
-    if (!buffer_cache_enabled() || !cached_guest_range(addr, copied, rprof::kUpVertex, b))
+    // The exact-byte backend must not undo reachable-window trimming by
+    // comparing/uploading an otherwise unused vertex prefix. Keep that
+    // validated path; persist the full ranges that are actually needed.
+    if ((copyWindow && buffer_cache_exact_raw()) ||
+        !buffer_cache_enabled() || !cached_guest_range(addr, copied, rprof::kUpVertex, b))
       b = copyWindow
         ? vertex_window_snapshot(g.attributeBufferIndex,addr,copied,
                                  uint32_t(windowBegin),uint32_t(windowEnd-windowBegin))
@@ -2726,8 +3211,8 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
   }
   if(R.gpuPassTimestampsEnabled) gpu_count_render_draw();
   for (auto *color : colors)
-    if (color) mark_gpu_written(color);
-  if (depth) mark_gpu_written(depth);
+    if (color) mark_draw_target_written(color);
+  if (depth) mark_draw_target_written(depth);
   R.drawCount++;
   if (aoPrivateReplay) {
     aoPrivateFrame = R.frame;
@@ -2740,6 +3225,9 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
       ~ReplayGuard() { aoPrivateReplay = false; }
     } guard;
     draw(r, prim, count, indexType, indexAddr, baseVertex, instances);
+    // the replay changes later lookups (aoPrivateSource/aoPrivateFrame, private images)
+    continued.valid = false;
+    continued.invalidReason = kAoReplay;
   }
   static const uint32_t drawBatch = parse_draw_batch(std::getenv("WWHD_VK_DRAW_BATCH"));
   static const uint32_t drawBatchCap =

@@ -1,3 +1,4 @@
+#include "platform/uwp_write_guard.h"
 #include "gfx/display_modes.h"
 #include "../game_clock.h"
 #include "vsync_pacing.h"
@@ -24,6 +25,8 @@
 #include "register_blocks.h"
 #include "gx2_texture_regs.h"
 #include "backend_hooks.h"
+#include "state_groups.h"
+#include "uniform_register_batch.h"
 #ifdef WWHD_HAS_VULKAN
 #include "gfx/vulkan/api.h"
 #endif
@@ -36,6 +39,9 @@
 #include "platform/perf_hint.h"
 #include "platform/thread_sampler.h"
 #include "render_prof.h"
+#ifdef WWHD_UWP
+#include "gfx/decorative_grass.h"
+#endif
 
 using namespace Latte;
 
@@ -82,6 +88,23 @@ static bool shader_irrelevant(uint32 reg) {
     return false;
 }
 static ShaderKeyDirtyStats shaderKeyDirtyStats;
+
+// register state groups (state_groups.h): the continued-draw fast path of the Vulkan renderer
+uint64_t g_full_state_version = 1;
+uint32_t g_dirty_groups = 0;
+static const struct StateGroupTable {
+    uint8_t group[kNumRegs];
+    StateGroupTable() { for (uint32 r = 0; r < kNumRegs; ++r) group[r] = state_group(r); }
+} g_state_groups;
+static inline void note_state_change(uint32 reg, uint32 old, uint32 value) {
+    const uint32 g = state_group_change(g_state_groups.group[reg], old, value);
+    g_dirty_groups |= 1u << g;
+    g_full_state_version += !((kSgContinuedMask >> g) & 1);
+}
+static inline void note_full_state_change() {
+    g_dirty_groups |= 1u << kSgOther;
+    ++g_full_state_version;
+}
 ShaderKeyDirtyStats shader_key_dirty_stats() { return shaderKeyDirtyStats; }
 
 // which register changes count for the shader key (backend_hooks.h), picked once the renderer runs
@@ -104,6 +127,7 @@ static void apply_small_regs(uint32 first, const uint32* v, uint32 n) {
         const uint32 reg = first + i, value = v[i], old = g_regs[reg];
         if (old != value) {
             changed = true;
+            note_state_change(reg, old, value);
             if (classify) {
                 if (rprof::fast_class_reg(reg)) rprof::g_reg_dirty |= 1;
                 else rprof::note_other_reg(reg);
@@ -136,6 +160,29 @@ static void apply_regs(uint32 first, const uint32* v, uint32 n) {
     if (first >= kNumRegs || n > kNumRegs - first) return;
     g_register_blocks.touch(first, n);
 #ifdef WWHD_HAS_VULKAN
+    static const bool uniformBatch = [] {
+        const char* e = getenv("WWHD_VK_ALU_REG_BATCH");
+        // Experimental: homogeneous ALU constants need one block comparison,
+        // not per-word classifications. Keep explicit opt-in for scene A/B.
+        return render::vulkan() && e && !strcmp(e, "1");
+    }();
+    if (uniformBatch) {
+        const auto result = uniform_register_batch<mmSQ_ALU_CONSTANT0_0, 0x1000>(g_regs, first, v, n);
+        if (result != UniformRegisterBatch::outside) {
+            if (result == UniformRegisterBatch::changed) {
+                g_dirty_groups |= 1u << kSgAluConst;
+                if (rprof::enabled()) rprof::g_reg_dirty |= 1;
+                // Identical classification for every changed word: no full-state
+                // version or shader-key bump. Keep diagnostic batch counts exact.
+                static const bool stats = getenv("WWHD_VK_STATS") != nullptr;
+                if (stats) ++shaderKeyDirtyStats.changedBatches;
+                memcpy(&g_regs[first], v, size_t(n) * sizeof(uint32));
+            }
+            // A context shadow can differ even when live registers match.
+            if (g_shadow) memcpy(&g_shadow[first], v, size_t(n) * sizeof(uint32));
+            return;
+        }
+    }
     // Vulkan renderer only (the Metal renderer keeps the original bulk path)
     static const bool fusedSmall = [] {
         const char* e = getenv("WWHD_VK_FUSE_SMALL_REGS");
@@ -148,6 +195,8 @@ static void apply_regs(uint32 first, const uint32* v, uint32 n) {
     }
 #endif
     if (memcmp(&g_regs[first], v, n * 4) != 0) {
+        for (uint32 i = 0; i < n; i++)
+            if (g_regs[first + i] != v[i]) note_state_change(first + i, g_regs[first + i], v[i]);
         if (rprof::enabled())  // draw classifier (render_prof.h)
             for (uint32 i = 0; i < n; i++)
                 if (g_regs[first + i] != v[i]) {
@@ -229,7 +278,7 @@ static void render_thread_main() {
 
 static void enqueue(Op op, const uint32* payload, uint32 n) {
     static std::once_flag once;
-    std::call_once(once, [] { std::thread([] { exception_report::boundary("GX2 render thread", render_thread_main); }).detach(); });
+    std::call_once(once, [] { uwp_write_guard::start_thread([] { exception_report::boundary("GX2 render thread", render_thread_main); }).detach(); });
     std::lock_guard<std::mutex> lk(g_q_mutex);
     g_q_pending.push_back(op | (n << 8));
     g_q_pending.insert(g_q_pending.end(), payload, payload + n);
@@ -318,6 +367,7 @@ static void emit_host(Op op, std::initializer_list<uint32> payload) {
     host::with_autorelease_pool([&] { execute_one(op, payload.begin(), (uint32)payload.size()); });
 }
 
+
 #ifdef WWHD_HAS_VULKAN
 void checkpoint_vulkan_caches() {
     render_sync();
@@ -372,6 +422,7 @@ static void set_context(uint32 ctx) {
     if (g_register_blocks.restore(g_regs, g_shadow, [](uint32 reg, uint32 old, uint32 value) {
         return !shader_irrelevant(reg) && shader_key_changed(shader_key_mask(), reg, old, value);
     })) ++g_shader_state_gen;
+    note_full_state_change();
     rprof::g_reg_dirty |= 2;  // draw classifier: a context load counts as a full state change
 }
 
@@ -822,9 +873,16 @@ HLE(gx2, GX2GetCurrentDisplayList) {
 HLE(gx2, GX2CallDisplayList) { emit(OP_CALL, {arg(c, 0), arg(c, 1)}); }
 HLE(gx2, GX2DirectCallDisplayList) { emit(OP_CALL, {arg(c, 0), arg(c, 1)}); }
 
+
+
 // ---------------------------------------------------------------- draws
 HLE(gx2, GX2DrawEx) { emit(OP_DRAW, {arg(c, 0), arg(c, 1), arg(c, 2), arg(c, 3)}); }
-HLE(gx2, GX2DrawIndexedEx) { emit(OP_DRAW_INDEXED, {arg(c, 0), arg(c, 1), arg(c, 2), arg(c, 3), arg(c, 4), arg(c, 5)}); }
+HLE(gx2, GX2DrawIndexedEx) {
+#ifdef WWHD_UWP
+    if(decorative_grass::drawing&&decorative_grass::omit_draw(arg(c,0),arg(c,1),arg(c,2),arg(c,3),arg(c,4),arg(c,5)))return;
+#endif
+    emit(OP_DRAW_INDEXED, {arg(c, 0), arg(c, 1), arg(c, 2), arg(c, 3), arg(c, 4), arg(c, 5)});
+}
 
 // ---------------------------------------------------------------- clears and copies
 static float farg(Cpu* c, int i) { return (float)c->f[1 + i].ps0; }
@@ -1159,6 +1217,7 @@ void gx2_ss_load(ss::Reader& r) {
     auto it = g_contexts.find(active);
     g_shadow = active && it != g_contexts.end() ? it->second.data() : nullptr;
     g_shader_state_gen++;
+    note_full_state_change();
     g_swap_interval = std::max<uint32>(r.u32(), 1);
     uint64_t guest_swaps = r.u64();
     {

@@ -19,6 +19,7 @@
 #include "render_prof.h"
 #include "perf_metrics.h"
 #include "write_watch.h"
+#include "uwp_texture_watch.h"
 #include "shaders.h"
 #include "gx2/gx2.h"
 #include "Cafe/HW/Latte/ISA/RegDefines.h"
@@ -47,6 +48,10 @@
 #include <thread>
 
 namespace gfxvk {
+#ifdef WWHD_UWP
+void native_write_watch_probe();
+void structured_write_guard_probe();
+#endif
 extern uint64_t g_stat_full_checks, g_stat_uploads;
 void request_tv_dump(const std::string&,int);
 namespace {
@@ -217,19 +222,49 @@ void buffer_cache_check() {
  require(cached_guest_range(addr,size,rprof::kUpVertex,b)&&b.buffer==a.buffer&&b.offset==a.offset,"unchanged range was not a hit");
  require(cached_guest_range(addr,size/2,rprof::kUpUbo,b)&&b.offset==a.offset,"sub-range with the same start was not a hit");
  mem::ptr(addr)[size-3]^=0xA5;  // unannounced CPU write: page fault, newer stamp
+ if(buffer_cache_exact_raw()) {
+   UploadSlice prefix;
+   require(cached_guest_range(addr,size/2,rprof::kUpVertex,prefix)&&prefix.offset==a.offset,"unused tail invalidated a matching GPU prefix");
+   gpu_equals_guest(prefix,addr,size/2,"matching GPU prefix differs after an unused tail write");
+ }
  require(cached_guest_range(addr,size,rprof::kUpVertex,b)&&b.offset!=a.offset,"written range was not uploaded again");
  gpu_equals_guest(b,addr,size,"re-uploaded range differs on the GPU");
  gpu_equals_guest(b,addr,size,"re-uploaded range changed after a submission");
  a=b;buffer_cache_guest_invalidate(1,addr+16,4);
- require(cached_guest_range(addr,size,rprof::kUpVertex,b)&&b.offset!=a.offset,"GX2Invalidate did not refresh the range");
+ require(cached_guest_range(addr,size,rprof::kUpVertex,b)&&(buffer_cache_exact_raw() || b.offset!=a.offset),"GX2Invalidate did not refresh the range");
  a=b;buffer_cache_invalidate_all();
  require(cached_guest_range(addr,size,rprof::kUpVertex,b)&&b.offset!=a.offset,"save-state reset did not refresh the range");
  gpu_equals_guest(b,addr,size,"range after reset differs on the GPU");
  UploadSlice ix;bufcache::Entry* entry=nullptr;
- require(cached_native_indices(addr+size,4096,ix,entry)&&entry&&entry->shadow.size()==4096&&!memcmp(entry->shadow.data(),mem::ptr(addr+size),4096),"index shadow differs");
- gpu_equals_guest(ix,addr+size,4096,"cached index data differs on the GPU");
+ if(buffer_cache_exact_raw()) {
+   require(!cached_native_indices(addr+size,4096,ix,entry),"raw-only cache accepted native indices");
+   UploadSlice grown;
+   require(cached_guest_range(addr,size*2,rprof::kUpVertex,grown),"persistent range did not grow");
+   gpu_equals_guest(grown,addr,size*2,"grown persistent range GPU data differs");
+   // Queue reads of the old and new immutable regions before retiring either.
+   // A stale region must not be overwritten while pending GPU work reads it.
+   Buffer snapshots=create_readback_buffer(size*4);
+   std::vector<uint8_t> before(mem::ptr(addr),mem::ptr(addr)+size*2);
+   VkBufferCopy oldCopy{grown.offset,0,size*2};
+   auto cmd=command_buffer();record::vkCmdCopyBuffer(cmd,grown.buffer,snapshots.buffer,1,&oldCopy);
+   flush_async();
+   mem::ptr(addr)[size*2-1]^=0x47;
+   buffer_cache_invalidate_all(); // force a replacement without the churn heuristic
+   UploadSlice newer;require(cached_guest_range(addr,size*2,rprof::kUpVertex,newer),"pending region replacement failed");
+   VkBufferCopy newCopy{newer.offset,size*2,size*2};cmd=command_buffer();
+   record::vkCmdCopyBuffer(cmd,newer.buffer,snapshots.buffer,1,&newCopy);
+   VkBufferMemoryBarrier barrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};barrier.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;barrier.dstAccessMask=VK_ACCESS_HOST_READ_BIT;barrier.srcQueueFamilyIndex=barrier.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;barrier.buffer=snapshots.buffer;barrier.size=VK_WHOLE_SIZE;
+   record::vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,0,nullptr,1,&barrier,0,nullptr);flush();
+   require(!memcmp(snapshots.mapped,before.data(),size*2),"pending persistent region was overwritten");
+   require(!memcmp(static_cast<uint8_t*>(snapshots.mapped)+size*2,mem::ptr(addr),size*2),"replacement persistent region GPU data differs");
+   defer_buffer(snapshots);
+   fprintf(stderr,"[renderer smoke] persistent raw GPU readback, growth, unchanged hint, reset, index bypass and pending old/new immutable regions passed\n");
+ } else {
+   require(cached_native_indices(addr+size,4096,ix,entry)&&entry&&entry->shadow.size()==4096&&!memcmp(entry->shadow.data(),mem::ptr(addr+size),4096),"index shadow differs");
+   gpu_equals_guest(ix,addr+size,4096,"cached index data differs on the GPU");
+ }
  command_buffer();flush();require(R.garbageCacheRegions.empty(),"replaced buffer cache regions were not retired");
- fprintf(stderr,"[renderer smoke] buffer cache hit, write fault, GX2Invalidate, reset and index readback passed\n");
+ if(!buffer_cache_exact_raw())fprintf(stderr,"[renderer smoke] buffer cache hit, write fault, GX2Invalidate, reset and index readback passed\n");
 }
 void associative_vertex_snapshot_check() {
 #ifdef WWHD_UWP
@@ -739,6 +774,26 @@ void vertex_window_check(Surface& s) {
  require(!sameSlice(outside,changed),"vertex window fetched mutation reused stale slice");
  auto shifted=vertex_window_smoke_snapshot(0,address,reserved,offset+sizeof(Vertex),reserved-offset-sizeof(Vertex),data.data(),true);
  require(!sameSlice(changed,shifted),"vertex window shifted key reused stale slice");
+#ifdef WWHD_UWP
+ const char* windowsEnv=std::getenv("WWHD_UWP_VERTEX_WINDOWS");
+ if(reuse && windowsEnv && !std::strcmp(windowsEnv,"1")) {
+  // Alternate immutable ranges without flushing: all returned handles remain
+  // alive, and every requested byte must match the corresponding fresh window.
+  std::array<UploadSlice,4> snapshots{};
+  for(uint32_t i=0;i<4;++i) {
+   const uint32_t start=offset+i*sizeof(Vertex);
+   snapshots[i]=vertex_window_smoke_snapshot(0,address,reserved,start,reserved-start,data.data(),true);
+  }
+  for(int repeat=0;repeat<8;++repeat)for(uint32_t i=0;i<4;++i) {
+   const uint32_t start=offset+i*sizeof(Vertex);
+   auto slice=vertex_window_smoke_snapshot(0,address,reserved,start,reserved-start,data.data(),true);
+   require(sameSlice(slice,snapshots[i]),"associative window did not reuse alternating range");
+   require(!memcmp(static_cast<uint8_t*>(slice.mapped)+start,reinterpret_cast<const uint8_t*>(data.data())+start,reserved-start),"associative window fetched bytes differ");
+  }
+  require(static_cast<const Vertex*>(static_cast<const void*>(static_cast<const uint8_t*>(original.mapped)+offset))[1].g==0,"queued original window changed after mutation");
+  fprintf(stderr,"[renderer smoke] alternating immutable vertex windows and old-snapshot lifetime passed\n");
+ }
+#endif
  data[101].g=0;
  auto render=[&](bool window,uint32_t first,int32_t base,bool narrow,bool restart,bool converted) {
   const uint32_t end=restart?first+6:first+3;
@@ -780,6 +835,110 @@ void vertex_window_check(Surface& s) {
  require(final[(size_t(s.extent.height/2)*s.extent.width+s.extent.width/2)*4]>200,"vertex window ring retirement failed");
  fprintf(stderr,"[renderer smoke] vertex copy windows/full pixels, poison, signed base, restart, mutation and ring retirement passed\n");
 }
+// Synthetic shader metadata, no game assets. Compare the production cached
+// packer against the original for changing inputs, layouts and postprocessing.
+void support_uniform_pack_check() {
+ std::vector<uint32_t> regs(0x10000,0x3f800000);
+ for(bool vertex:{false,true}) {
+  LatteDecompilerShader decoded(vertex?LatteConst::ShaderType::Vertex:LatteConst::ShaderType::Pixel);
+  vk::Shader shader;shader.vertex=vertex;shader.dec=&decoded;
+  auto& u=shader.uniforms;u.offset_remapped=0;u.offset_uniformRegister=32;u.count_uniformRegister=2;
+  u.offset_alphaTestRef=64;u.offset_pointSize=68;u.offset_fragCoordScale=80;
+  u.offset_windowSpaceToClipSpaceTransform=96;u.offset_texScale[0]=112;u.offset_texScale[LATTE_NUM_MAX_TEX_UNITS-1]=120;u.offset_endOfBlock=144;
+  decltype(decoded.list_remappedUniformEntries_register)::value_type entry{};
+  entry.indexOffset=48;entry.mappedIndexOffset=0;decoded.list_remappedUniformEntries_register.push_back(entry);
+  const uint32_t base=mmSQ_ALU_CONSTANT0_0+(vertex?0x400:0);
+  std::vector<uint8_t> expected,actual;
+  for(unsigned i=0;i<1024;++i) {
+   if(i%7==0) regs[base+(i%8)]^=1;
+   if(i%11==0) regs[base+12+(i%4)]^=2;
+   if(i%13==0) regs[Latte::REGADDR::SX_ALPHA_REF]^=0x80000000;
+   if(i%17==0) regs[Latte::REGADDR::PA_SU_POINT_SIZE]^=8;
+   if(i%23==0) regs[Latte::REGADDR::PA_CL_VPORT_XSCALE]^=1;
+   if(i%29==0) regs[Latte::REGADDR::PA_CL_VPORT_YSCALE]^=2;
+   const float sx=i<512?1.5f:1.0f,sy=i<768?1.5f:2.0f;
+   vk::pack_uniforms_into(regs.data(),shader,expected,sx,sy,0,600);
+   vk::pack_uniforms_cached_into(regs.data(),shader,actual,sx,sy,0,600);
+   require(actual==expected,"support uniform memo differs from original packer");
+   actual[0]^=0xff; // caller-owned bloom/AO adjustments must never poison memo
+  }
+  vk::pack_uniforms_into(regs.data(),shader,expected,1.5f,1.5f,0.1f,600);
+  vk::pack_uniforms_cached_into(regs.data(),shader,actual,1.5f,1.5f,0.1f,600);
+  require(actual==expected,"stereo support packing fallback differs");
+  // Even an empty guest-backed group is conservatively excluded from memo.
+  shader.uniformPackMemo={};shader.uniformPackPlan={};decoded.list_remappedUniformEntries_bufferGroups.emplace_back(0,0);
+  vk::pack_uniforms_into(regs.data(),shader,expected,1,1,0,600);
+  vk::pack_uniforms_cached_into(regs.data(),shader,actual,1,1,0,600);
+  require(actual==expected && !shader.uniformPackMemo.eligible,"guest-backed support packing fallback differs");
+  auto& group=decoded.list_remappedUniformEntries_bufferGroups.back();
+  decltype(group.entries)::value_type guestEntry{};guestEntry.indexOffset=32;guestEntry.mappedIndexOffset=16;
+  group.entries.push_back(guestEntry);shader.uniformPackMemo={};shader.uniformPackPlan={};
+  const uint32_t guest=mem::host_alloc(512,256);
+  const uint32_t block=vertex?mmSQ_VTX_UNIFORM_BLOCK_START:mmSQ_PS_UNIFORM_BLOCK_START;
+  regs[block+1]=255;
+  for(unsigned i=0;i<256;++i) {
+   std::array<uint32_t,4> bytes{i,i^0x80000000u,i+99,i*17};
+   std::memcpy(mem::ptr(guest+32),bytes.data(),16);bytes[0]^=0xffffffffu;
+   std::memcpy(mem::ptr(guest+256+32),bytes.data(),16);
+   regs[block]=i%17?guest+(i%2)*256:0;
+   const float scale=i%23?1.5f:0.0f;
+   vk::pack_uniforms_into(regs.data(),shader,expected,scale,1.5f,0,600);
+   vk::pack_uniforms_cached_into(regs.data(),shader,actual,scale,1.5f,0,600);
+   require(actual==expected,"planned guest pack missed source mutation, address change or null buffer");
+  }
+  // Contiguous vec4s must merge without changing gaps, overlapping later
+  // writes, unaligned source addresses, null blocks or per-draw mutations.
+  const int savedRegisterOffset=u.offset_uniformRegister;
+  u.offset_uniformRegister=-1;
+  group.entries.clear();
+  for(uint32_t n=0;n<4;++n) {
+   guestEntry.indexOffset=32+n*16;guestEntry.mappedIndexOffset=16+n*16;
+   group.entries.push_back(guestEntry);
+  }
+  guestEntry.indexOffset=160;guestEntry.mappedIndexOffset=24;
+  group.entries.push_back(guestEntry); // later overlapping destination wins
+  shader.uniformPackPlan={};shader.uniformPackMemo={};
+  for(uint32_t i=0;i<128;++i) {
+   for(uint32_t byte=0;byte<240;++byte)
+    static_cast<uint8_t*>(mem::ptr(guest))[byte]=uint8_t(byte*17+i*31);
+   regs[block]=i%13?guest+(i%3):0;
+   vk::pack_uniforms_into(regs.data(),shader,expected,1.5f,1,0,600);
+   vk::pack_uniforms_cached_into(regs.data(),shader,actual,1.5f,1,0,600);
+   require(actual==expected,"contiguous support gather changed mutation, alignment or write order");
+  }
+  u.offset_uniformRegister=savedRegisterOffset;
+  shader.uniformPackPlan={};shader.uniformPackMemo={};
+  // Isolated production-packer kernel timing, not a game FPS benchmark. Both
+  // paths use the same live synthetic bytes, alternating order over six rounds.
+  const char* packMode=std::getenv("WWHD_VK_UNIFORM_PACK");
+  if(packMode && !std::strcmp(packMode,"optimized")) {
+   regs[block]=guest; // benchmark actual non-null, freshly read guest inputs
+   std::array<std::vector<double>,2> samples;
+   auto time=[&](bool candidate) {
+    const auto start=std::chrono::steady_clock::now();
+    for(unsigned n=0;n<8192;++n) {
+     if(candidate)vk::pack_uniforms_cached_into(regs.data(),shader,actual,1.5f,1.5f,0,600);
+     else vk::pack_uniforms_into(regs.data(),shader,expected,1.5f,1.5f,0,600);
+    }
+    const double ns=std::chrono::duration<double,std::nano>(std::chrono::steady_clock::now()-start).count()/8192;
+    samples[candidate].push_back(ns);
+   };
+   for(unsigned round=0;round<6;++round) {time(round%2);time(!(round%2));}
+   for(auto& sample:samples)std::sort(sample.begin(),sample.end());
+   require(actual==expected,"uniform kernel timing changed output");
+   fprintf(stderr,"[uniform packing kernel] %s synthetic guest layout: original %.1f ns/pack; planned %.1f ns/pack; six alternating rounds; not game FPS\n",
+    vertex?"VS":"PS",(samples[0][2]+samples[0][3])/2,(samples[1][2]+samples[1][3])/2);
+  }
+  // Malformed overlapping constant/dynamic destinations retain original order
+  // by rejecting the hoisted template and using the original packer.
+  u.offset_texScale[0]=u.offset_alphaTestRef;shader.uniformPackMemo={};shader.uniformPackPlan={};
+  vk::pack_uniforms_into(regs.data(),shader,expected,1,1,0,600);
+  vk::pack_uniforms_cached_into(regs.data(),shader,actual,1,1,0,600);
+  require(actual==expected && !shader.uniformPackPlan.eligible,"overlapping uniform layout fallback differs");
+ }
+ fprintf(stderr,"[renderer smoke] support uniform memo: 2816 byte-exact production pack comparisons; contiguous/overlapping writes, guest mutations/null/address changes, stereo and overlap fallbacks passed\n");
+}
+
 void dynamic_uniform_check(Surface& s) {
  if(R.properties.limits.maxDescriptorSetUniformBuffersDynamic<3) {
   fprintf(stderr,"[renderer smoke] dynamic UBO ordering fixture skipped (device limit <3)\n");return;
@@ -1072,8 +1231,77 @@ int android_display_smoke_test() {
 }
 #endif
 
+// No submitted work uses this private pool. Actual renderer smoke draws below
+// separately exercise the normal fenced pool retirement and GPU descriptor use.
+static void descriptor_pool_reset_check() {
+ struct Objects {
+  VkDescriptorPool pool=VK_NULL_HANDLE;
+  VkDescriptorSetLayout layout=VK_NULL_HANDLE;
+  ~Objects(){if(pool)vkDestroyDescriptorPool(R.device,pool,nullptr);if(layout)vkDestroyDescriptorSetLayout(R.device,layout,nullptr);}
+ } objects;
+ VkDescriptorSetLayoutBinding binding{0,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr};
+ VkDescriptorSetLayoutCreateInfo layout{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+ layout.bindingCount=1;layout.pBindings=&binding;
+ vk_check(vkCreateDescriptorSetLayout(R.device,&layout,nullptr,&objects.layout),"reset regression layout");
+ constexpr uint32_t capacity=32768;
+ VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,capacity};
+ VkDescriptorPoolCreateInfo info{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+ info.flags=VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;info.maxSets=capacity;info.poolSizeCount=1;info.pPoolSizes=&size;
+ vk_check(vkCreateDescriptorPool(R.device,&info,nullptr,&objects.pool),"reset regression pool");
+ auto freeSets=reinterpret_cast<PFN_vkFreeDescriptorSets>(vkGetDeviceProcAddr(R.device,"vkFreeDescriptorSets"));
+ require(freeSets!=nullptr,"mandatory descriptor free entry unavailable");
+ auto allocate=[&](uint32_t n) {
+  std::vector<VkDescriptorSetLayout> layouts(n,objects.layout);std::vector<VkDescriptorSet> sets(n);
+  VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+  ai.descriptorPool=objects.pool;ai.descriptorSetCount=n;ai.pSetLayouts=layouts.data();
+  vk_check(vkAllocateDescriptorSets(R.device,&ai,sets.data()),"reset regression allocation");return sets;
+ };
+ auto reset=[&] {vk_check(vkResetDescriptorPool(R.device,objects.pool,0),"reset regression reset");};
+ reset();reset(); // Empty and never-used capacity.
+ for(uint32_t count : {1u,128u,512u,2048u,capacity}) {
+  auto sets=allocate(count);
+  std::vector<VkDescriptorSet> holes;
+  for(uint32_t i=0;i<count;i+=3)holes.push_back(sets[i]);
+  // Include the highest occupied slot, exercising the recomputed upper bound.
+  if((count-1)%3!=0)holes.push_back(sets.back());
+  vk_check(freeSets(R.device,objects.pool,uint32_t(holes.size()),holes.data()),"reset regression free holes");
+  (void)allocate(1); // Reuse a free slot before resetting remaining live sets.
+  reset();reset();
+ }
+ // Allocation rollback must leave a valid high-water mark and permit reuse.
+ std::vector<VkDescriptorSetLayout> tooMany(capacity+1,objects.layout);
+ std::vector<VkDescriptorSet> failed(capacity+1);
+ VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+ ai.descriptorPool=objects.pool;ai.descriptorSetCount=capacity+1;ai.pSetLayouts=tooMany.data();
+ require(vkAllocateDescriptorSets(R.device,&ai,failed.data())!=VK_SUCCESS,"descriptor capacity unexpectedly exceeded");
+ reset();(void)allocate(capacity);reset();(void)allocate(1);reset();
+ fprintf(stderr,"[renderer smoke] descriptor pool reset empty/sparse/full/free-holes/high-tail/rollback/reuse passed (capacity 32768)\n");
+}
 int renderer_smoke_test() {
  try {
+  mem::init();
+#ifdef WWHD_UWP
+    native_write_watch_probe();
+    structured_write_guard_probe();
+    if(uwp_texture_watch::active()) {
+     const uint32_t addr=mem::host_alloc(3*4096,4096);
+     const std::pair<uint32_t,uint32_t> a{addr,8192},b{addr+4096,8192};
+     uint64_t first=0,second=0;
+     require(uwp_texture_watch::changed(&a,1,first),"native watch initial range not dirty");
+     require(uwp_texture_watch::changed(&b,1,second),"native watch initial alias not dirty");
+     require(!uwp_texture_watch::changed(&a,1,first),"native watch unchanged range dirty");
+     require(!uwp_texture_watch::changed(&b,1,second),"native watch unchanged alias dirty");
+     mem::ptr(addr)[4096+13]^=3;
+     require(uwp_texture_watch::changed(&a,1,first),"native watch lost first alias write");
+     require(uwp_texture_watch::changed(&b,1,second),"native watch consumed overlapping alias write");
+     require(!uwp_texture_watch::changed(&a,1,first),"native watch failed to acknowledge range");
+     mem::ptr(addr)[3*4096-1]^=7;
+     require(!uwp_texture_watch::changed(&a,1,first),"native watch dirtied disjoint range");
+     require(uwp_texture_watch::changed(&b,1,second),"native watch lost unannounced tail write");
+     fprintf(stderr,"[renderer smoke] native texture epochs initial/clean/overlapping aliases/disjoint/tail passed\n");
+    }
+#endif
+    descriptor_pool_reset_check();
   // Test-only calibration: CI requires the layer to report this intentional WAW.
   if(std::getenv("WWHD_VK_SYNC_NEGATIVE_CONTROL")) {
    Buffer b=create_buffer(16,VK_BUFFER_USAGE_TRANSFER_DST_BIT,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
@@ -1086,7 +1314,6 @@ int renderer_smoke_test() {
    LOG("[renderer smoke] sync negative control submitted two unordered writes");
    command_buffer();flush();return 0;
   }
-  mem::init();
   {
    Image target(32,32,0x1a);
    for(auto format:{VK_FORMAT_R8G8B8_UINT,VK_FORMAT_R16G16B16_UINT,VK_FORMAT_R32G32B32_UINT}) {
@@ -1129,7 +1356,8 @@ int renderer_smoke_test() {
 #ifdef WWHD_UWP
    // Without write-fault tracking, UWP must inspect CPU textures in full each frame.
    // It must still avoid uploading unchanged contents and preserve the same-frame gate.
-   require(g_stat_full_checks==checks+1&&g_stat_uploads==uploads,"UWP full hash failed to reuse an unchanged texture upload");
+   const bool nativeSkip=wwatch::active() || (uwp_texture_watch::active()&&!uwp_texture_watch::verify());
+   require(g_stat_full_checks==checks+(nativeSkip?0:1)&&g_stat_uploads==uploads,"UWP texture check failed to reuse an unchanged upload");
    checks=g_stat_full_checks;
 #else
    require(g_stat_full_checks==checks&&g_stat_uploads==uploads,"unchanged next-frame texture performed a full check");
@@ -1244,6 +1472,8 @@ int renderer_smoke_test() {
     R.mainDepthAddr=previousDepth;destroy_surface_image(surface);R.surfaces.erase(entry);
     fprintf(stderr,"[renderer smoke] asynchronous GPU depth peeks passed\n");
    }
+   sampler_lookup_self_test();
+   support_uniform_pack_check();
    stereo_geometry_check();
    Image rendered(64,64,0x1a);dynamic_uniform_check(rendered.s);vertex_window_check(rendered.s);triangle(rendered.s);
    if(R.tv.scan)destroy_surface_image(R.tv.scan.get());R.tv.scan=std::make_unique<Surface>();auto& scan=*R.tv.scan;scan.width=64;scan.height=64;scan.format=0x1a;scan.fmt=format_info(scan.format,false);create_surface_image(&scan,false);resample(&rendered.s,&scan,1);mark_gpu_written(&scan);

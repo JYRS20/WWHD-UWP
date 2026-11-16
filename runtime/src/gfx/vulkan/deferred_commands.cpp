@@ -1,4 +1,6 @@
 #include "deferred_commands.h"
+#include "command_trace.h"
+#include <chrono>
 #include <array>
 #include <cstdint>
 #include <optional>
@@ -54,7 +56,15 @@ void DeferredCommands::force_exact() {
 void DeferredCommands::emit_exact() {
     capturing_=false;
     if(active_deferred_commands==this)active_deferred_commands=nullptr;
-    while(emitted_<commands_.size()) { commands_[emitted_]();++emitted_; }
+    const bool trace=command_trace_enabled() && emitted_<commands_.size();
+    const auto started=trace?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
+    const size_t first=emitted_,payload=payloadBytes_;
+    auto record=[&](bool failed) {
+        if(trace)note_command_replay(uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-started).count()),emitted_-first,payload,failed);
+    };
+    try {while(emitted_<commands_.size()) { commands_[emitted_]();++emitted_; }}
+    catch(...) {record(true);throw;}
+    record(false);
     commands_.clear();payloadBytes_=0;emitted_=0;beforeExact_={};
 }
 void DeferredCommands::reset() {

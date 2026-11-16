@@ -4,6 +4,8 @@
 #include <windows.h>
 #include <stdexcept>
 #include <string>
+#include <cstdlib>
+#include <cstring>
 #include <winrt/Windows.System.h>
 #include "runtime.h"
 namespace gfxvk::uwp_driver {
@@ -21,7 +23,12 @@ void log_memory(uint64_t frame, size_t surfaces) noexcept {
  } catch (...) { LOG("[uwp memory] app budget query unavailable"); }
 }
 PFN_vkGetInstanceProcAddr open(){
- if(!driver)driver=LoadPackagedLibrary(L"vulkan_dzn.dll",0);
+ if(!driver) {
+  const char* mode=std::getenv("WWHD_UWP_DZN_RESET_BASELINE");
+  const bool baseline=mode && !std::strcmp(mode,"1");
+  driver=LoadPackagedLibrary(baseline?L"vulkan_dzn_baseline.dll":L"vulkan_dzn.dll",0);
+  LOG("[uwp Dozen] packaged driver: %s",baseline?"vulkan_dzn_baseline.dll":"vulkan_dzn.dll");
+ }
  if(!driver)throw std::runtime_error("Packaged Dozen driver failed to load: "+std::to_string(GetLastError()));
  auto get=reinterpret_cast<PFN_vkGetInstanceProcAddr>(GetProcAddress(driver,"vk_icdGetInstanceProcAddr"));
  createCoreWindowSurface=reinterpret_cast<CreateSurface>(GetProcAddress(driver,"wwhd_dzn_create_core_window_surface"));

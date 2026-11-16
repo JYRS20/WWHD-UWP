@@ -748,6 +748,12 @@ static std::atomic<bool> g_paced{[] {
 static std::atomic<bool> g_paced_hi{!g_env_paced || atoi(g_env_paced) != 0};  // 120/240 fps
 static std::atomic<bool>& paced_flag(int f) { return f > 60 ? g_paced_hi : g_paced; }
 static bool paced() { return paced_flag(fps()).load(std::memory_order_relaxed); }
+// Diagnostic rollback for the wall-clock cadence correction; independent of
+// the user's interpolation and original 30 Hz game-logic settings.
+static bool paced_clock_schedule() {
+    static const bool on = !getenv("WWHD_INTERP_CLOCK_SCHEDULE") || atoi(getenv("WWHD_INTERP_CLOCK_SCHEDULE")) != 0;
+    return on;
+}
 bool paced_interpolation() { return paced(); }  // at the current frame rate
 bool paced_interpolation_at(int f) { return paced_flag(f).load(std::memory_order_relaxed); }
 void set_paced_interpolation_at(int f, bool on) {
@@ -861,13 +867,16 @@ static void paced_pass_start() {
         trace_step(now, due - kPacedStep, 'W');
         return;
     }
-    // 120/240 fps before there is a step slot (every step waits for its time): a step that starts
+    // Before there is a step slot (also 60 fps): a step that starts
     // late, because its in-between passes took longer than planned, keeps the schedule if it is less
     // than a step late, so this step plans fewer in-between frames and the game catches up (counted
     // from its own start, a late step was lost: 29.4 logic steps a second at 240 fps on a computer
     // that draws ~150 fps)
-    const bool keep = g_wait_step && in_between() > 1 && g_last_logic != pace_clock::time_point{} &&
-                      now - (g_last_logic + kPacedStep) < kPacedStep;
+    using ns = std::chrono::nanoseconds;
+    const auto plan = pacing::wall_step_start(ns(now.time_since_epoch()).count(), ns(g_last_logic.time_since_epoch()).count(),
+                                               ns(kPacedStep).count(), g_wait_step,
+                                               g_last_logic != pace_clock::time_point{});
+    const bool keep = (in_between() > 1 || paced_clock_schedule()) && plan.how == pacing::StepStart::kKeep;
     const auto before = g_last_logic;
     g_wait_step = false;
     g_last_logic = keep ? g_last_logic + kPacedStep : pace_clock::now();
@@ -922,7 +931,7 @@ static void after_pass(int phase) {
         g_hold_next = false;
         if (pacing) {
             paced_step_done(g_step_holds);
-            if (in_between() > 1) g_wait_step = true;  // fewer passes than planned would make the step short
+            if (in_between() > 1 || paced_clock_schedule()) g_wait_step = true;  // retain the deadline even after a completed record pass
         }
         return;
     }

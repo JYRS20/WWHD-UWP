@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.2.1
+
+Release packaging of the tested 0.1.26 runtime; later diagnostic experiments are excluded.
+
+- Reduced repeated render preparation and retained optimized buffer reuse.
+- Bundled Minimap HD with dungeon clipping, island framing and wind-arrow corrections.
+- Added an optional session-only distant-grass reduction setting.
+- Preserved USB/internal preparation, existing saves and the original game logic.
+- Excluded ash experiments, particle diagnostics and fire-study masks.
+
+The port remains experimental. Performance varies by scene; 60 FPS is not guaranteed.
+
 ## 0.1.4
 
 - Added internal game storage under `LocalState/WWHD/Games`.

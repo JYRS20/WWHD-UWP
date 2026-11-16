@@ -6,6 +6,8 @@
 #endif
 #include "platform/host.h"
 #include "write_watch.h"
+#include "uwp_texture_watch.h"
+#include "platform/uwp_write_guard.h"
 #ifdef WWHD_UWP
 #include "mods/guest_mods.h"
 #include "platform/file_access.h"
@@ -121,8 +123,16 @@ void init() {
     // null page guard: catches guest null-pointer accesses
     mprotect(PPC_MEM_BASE, 0x10000, PROT_NONE);
 #elif defined(WWHD_UWP)
-    // Do not set MEM_WRITE_WATCH: host::memory_touched conservatively preserves pages.
-    void* p = VirtualAllocFromApp(PPC_MEM_BASE, 0x100000000ull, MEM_RESERVE, PAGE_READWRITE);
+    // Opt-in texture-only research path; save-state memory_touched still
+    // conservatively preserves pages and never consumes these kernel bits.
+    bool nativeWatch=uwp_texture_watch::requested() && !uwp_write_guard::enabled();
+    void* p = VirtualAllocFromApp(PPC_MEM_BASE, 0x100000000ull,
+        MEM_RESERVE | (nativeWatch?MEM_WRITE_WATCH:0), PAGE_READWRITE);
+    if(!p && nativeWatch) {
+        LOG("[mem] native texture tracking reservation unavailable; original full-byte fallback");
+        nativeWatch=false;
+        p=VirtualAllocFromApp(PPC_MEM_BASE,0x100000000ull,MEM_RESERVE,PAGE_READWRITE);
+    }
     if(p != PPC_MEM_BASE) fatal("cannot reserve UWP guest address space (error=%lu)",GetLastError());
     struct Region { uint32_t address, size; };
     const Region regions[] = {
@@ -144,6 +154,7 @@ void init() {
         committed/1048576.0, importPages);
     ULONG old;
     if(!VirtualProtectFromApp(PPC_MEM_BASE,0x10000,PAGE_NOACCESS,&old)) fatal("cannot protect guest null page");
+    if(nativeWatch)uwp_texture_watch::init(PPC_MEM_BASE,0x100000000ull);
 #elif defined(_WIN32)
     void* p = VirtualAlloc(PPC_MEM_BASE, 0x100000000ull, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE);
     if(p != PPC_MEM_BASE) fatal("cannot reserve guest address space (error=%lu)",GetLastError());
@@ -168,6 +179,9 @@ void init() {
         LOG("[mem] write tracking unavailable: textures use sampled change checks");
 #endif
     }
+#ifdef WWHD_UWP
+    else LOG("[mem] guarded page-write tracking active; original texture/buffer cache protocol; no global VEH");
+#endif
 }
 
 static std::mutex g_alloc_log_m;

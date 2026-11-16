@@ -26,7 +26,7 @@ using namespace winrt::Windows::Storage;
 namespace fs=std::filesystem;
 struct Item {std::string name;StorageFolder folder{nullptr};StorageFile file{nullptr};};
 struct Listing {std::vector<Item> items;std::string path,error;};
-struct Request {bool folder;std::function<void(std::string)> chosen;};
+struct Request {bool folder;std::function<void(std::string)> chosen;bool game=false;};
 std::mutex request_mutex;
 std::unique_ptr<Request> pending;
 std::atomic<bool> visible{false};
@@ -41,23 +41,23 @@ struct Browser {
 Browser browser;
 std::string utf8(const fs::path& p){auto s=p.u8string();return {reinterpret_cast<const char*>(s.data()),s.size()};}
 std::wstring lower(std::wstring s){for(auto& c:s)c=std::towlower(c);return s;}
-Listing list_folder(StorageFolder folder,bool select_folder){
+Listing list_folder(StorageFolder folder,bool select_folder,bool game){
  winrt::init_apartment(winrt::apartment_type::multi_threaded);
  Listing result;
  try{
   if(!folder){
    auto app=ApplicationData::Current().LocalFolder().CreateFolderAsync(L"WWHD",CreationCollisionOption::OpenIfExists).get();
-   auto local=app.CreateFolderAsync(L"ModPackages",CreationCollisionOption::OpenIfExists).get();
-   result.items.push_back({"Internal mod packages",local});
+   auto local=app.CreateFolderAsync(game?L"GameCubeSources":L"ModPackages",CreationCollisionOption::OpenIfExists).get();
+   result.items.push_back({game?"Internal GameCube sources":"Internal mod packages",local});
    try{for(auto const& drive:KnownFolders::RemovableDevices().GetFoldersAsync().get())result.items.push_back({"USB - "+winrt::to_string(drive.Name()),drive});}
    catch(winrt::hresult_error const&){result.error="USB unavailable. You can still use internal mod packages.";}
-   result.path="Internal packages: LocalState / WWHD / ModPackages";
+   result.path=game?"Choose a GameCube source on USB, or in LocalState / WWHD / GameCubeSources":"Internal packages: LocalState / WWHD / ModPackages";
   }else{
    result.path=winrt::to_string(folder.Path());
    for(auto const& child:folder.GetFoldersAsync().get())result.items.push_back({winrt::to_string(child.Name()),child});
    if(!select_folder)for(auto const& file:folder.GetFilesAsync().get()){
     auto ext=lower(std::wstring(file.FileType()));
-    if(ext==L".zip"||ext==L".wwhdmod"||ext==L".pack")result.items.push_back({winrt::to_string(file.Name()),nullptr,file});
+    if(game?(ext==L".iso"||ext==L".gcm"||ext==L".rvz"):(ext==L".zip"||ext==L".wwhdmod"||ext==L".pack"))result.items.push_back({winrt::to_string(file.Name()),nullptr,file});
    }
    std::stable_sort(result.items.begin(),result.items.end(),[](const Item& a,const Item& b){if(bool(a.folder)!=bool(b.folder))return bool(a.folder);return a.name<b.name;});
   }
@@ -66,8 +66,8 @@ Listing list_folder(StorageFolder folder,bool select_folder){
 }
 void scan(){
  browser.list={};browser.focus=true;
- auto folder=browser.folder;auto mode=browser.request->folder;
- browser.scan=std::async(std::launch::async,[folder,mode]{return list_folder(folder,mode);});
+ auto folder=browser.folder;auto mode=browser.request->folder;auto game=browser.request->game;
+ browser.scan=std::async(std::launch::async,[folder,mode,game]{return list_folder(folder,mode,game);});
 }
 struct CopyBudget {uint64_t bytes=0;unsigned entries=0;std::shared_ptr<std::atomic<uint64_t>> progress;};
 void copy_file(const fs::path& from,const fs::path& to,CopyBudget& budget){
@@ -118,6 +118,16 @@ std::string stage(StorageFolder folder,StorageFile file,std::shared_ptr<std::ato
  }catch(...){winrt::uninit_apartment();throw;}
 }
 void select(StorageFolder folder,StorageFile file){
+ if(browser.request->game){
+  try {
+  // Keep the selected USB source accessible, without copying any game files.
+  auto item=folder?folder.as<winrt::Windows::Storage::IStorageItem>():file.as<winrt::Windows::Storage::IStorageItem>();
+  winrt::Windows::Storage::AccessCache::StorageApplicationPermissions::FutureAccessList().AddOrReplace(L"wwhd-gc-minimap-source",item);
+  auto path=winrt::to_string(item.Path());
+  browser.importing=std::async(std::launch::deferred,[path]{return path;});
+  }catch(winrt::hresult_error const& e){browser.list.error="Cannot select this source: "+winrt::to_string(e.message());}
+  return;
+ }
  browser.copied=std::make_shared<std::atomic<uint64_t>>(0);auto progress=browser.copied;
  browser.importing=std::async(std::launch::async,[folder,file,progress]{return stage(folder,file,progress);});
 }
@@ -127,27 +137,32 @@ void choose_mod(bool folder,std::function<void(std::string)> chosen){
  pending=std::make_unique<Request>(Request{folder,std::move(chosen)});visible=true;
 }
 bool active(){return visible.load();}
+void choose_game_cube(bool folder,std::function<void(std::string)> chosen){
+ std::lock_guard lock(request_mutex);if(visible.load()||pending)return;
+ pending=std::make_unique<Request>(Request{folder,std::move(chosen),true});visible=true;
+}
 void draw(){
  {std::lock_guard lock(request_mutex);if(pending){browser.request=std::move(pending);browser.folder=nullptr;browser.parents.clear();browser.popup=true;scan();}}
  if(!browser.request)return;
- if(browser.popup){ImGui::OpenPopup("Choose mod source");browser.popup=false;}
+ const char* title=browser.request->game?"Choose GameCube source":"Choose mod source";
+ if(browser.popup){ImGui::OpenPopup(title);browser.popup=false;}
  auto size=ImGui::GetIO().DisplaySize;
  ImGui::SetNextWindowSize(ImVec2((std::min)(size.x-32,850.f),(std::min)(size.y-32,560.f)),ImGuiCond_Appearing);
- if(!ImGui::BeginPopupModal("Choose mod source",nullptr,ImGuiWindowFlags_NoSavedSettings))return;
+ if(!ImGui::BeginPopupModal(title,nullptr,ImGuiWindowFlags_NoSavedSettings))return;
  bool busy=browser.scan.valid()||browser.importing.valid();
  if(browser.scan.valid()&&browser.scan.wait_for(std::chrono::seconds(0))==std::future_status::ready){
   try{browser.list=browser.scan.get();browser.focus=true;}catch(winrt::hresult_error const& e){browser.list.error=winrt::to_string(e.message());}catch(std::exception const& e){browser.list.error=e.what();}busy=false;
  }
  bool close=false;
- if(browser.importing.valid()&&browser.importing.wait_for(std::chrono::seconds(0))==std::future_status::ready){
+ if(browser.importing.valid()&&browser.importing.wait_for(std::chrono::seconds(0))!=std::future_status::timeout){
   try{auto path=browser.importing.get();auto chosen=browser.request->chosen;hostui::post([chosen,path]{chosen(path);});close=true;}
   catch(winrt::hresult_error const& e){browser.list.error=winrt::to_string(e.message());}
   catch(std::exception const& e){browser.list.error=e.what();}busy=false;
  }
  ImGui::TextWrapped("%s",browser.list.path.c_str());
- ImGui::TextDisabled("%s",browser.request->folder?"Open your mod folder, then choose Use this folder.":"Select a .wwhdmod, ZIP or replacement .pack file.");
+ ImGui::TextDisabled("%s",browser.request->game?(browser.request->folder?"Open the extracted GameCube game folder, then choose Use this folder.":"Select your GameCube Wind Waker ISO or RVZ. The disc stays on its storage device."):(browser.request->folder?"Open your mod folder, then choose Use this folder.":"Select a .wwhdmod, ZIP or replacement .pack file."));
  if(!browser.list.error.empty())ImGui::TextWrapped("%s",browser.list.error.c_str());
- if(browser.importing.valid())ImGui::Text("Importing mod: %.1f MiB",double(browser.copied->load())/(1u<<20));
+ if(browser.importing.valid())ImGui::Text("Importing mod: %.1f MiB",browser.copied?double(browser.copied->load())/(1u<<20):0.0);
  else if(busy)ImGui::TextUnformatted("Reading storage...");
  ImGui::BeginDisabled(busy);
  if(ImGui::Button("Storage devices")){browser.folder=nullptr;browser.parents.clear();scan();}

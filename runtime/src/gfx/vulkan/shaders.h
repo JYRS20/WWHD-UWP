@@ -5,6 +5,7 @@
 #include <vector>
 #include <memory>
 #include "../shader_identity.h"
+#include "uniform_pack_memo.h"
 #include "Cafe/HW/Latte/LegacyShaderDecompiler/LatteDecompiler.h"
 
 struct LatteFetchShader;
@@ -40,6 +41,14 @@ struct Shader {
     std::string glsl;
     std::string translatedGlsl;  // verify mode only: the translation a graphics pack replaced
     std::string error;
+    struct UniformPackPlan {
+        struct Copy { uint32_t word, sourceOffset, bytes; int32_t target; bool guest; };
+        bool initialized=false, eligible=false;
+        std::vector<Copy> copies;
+        std::vector<uint8_t> zeroTemplate;
+    };
+    mutable UniformPackPlan uniformPackPlan; // immutable layout; guest bytes always read afresh
+    mutable UniformPackMemo uniformPackMemo; // render-thread-only, raw pre-postprocessing bytes
     bool ready() const { return dec && (!spirv.empty() || binary) && error.empty(); }
 };
 // Render-thread-only lookup; recorded pipeline identity, never program hash.
@@ -82,6 +91,13 @@ std::vector<uint32_t> compile_glsl(const std::string& source, bool vertex, std::
 void pack_uniforms_into(const uint32_t* regs, const Shader& shader,
     std::vector<uint8_t>& data, float scaleX = 1.0f, float scaleY = 1.0f,
     float eyeOffset = 0, float convergence = 600);
+struct UniformPackStats {
+    uint64_t requests=0, hits=0, planned=0, packed=0, bypass=0, comparedBytes=0, verified=0;
+    uint64_t retainedBytes=0;
+};
+UniformPackStats uniform_pack_stats();
+void pack_uniforms_cached_into(const uint32_t* regs, const Shader& shader,
+    std::vector<uint8_t>& data, float scaleX, float scaleY, float eyeOffset, float convergence);
 std::vector<uint8_t> pack_uniforms(const uint32_t* regs, const Shader& shader,
     float scaleX = 1.0f, float scaleY = 1.0f);
 // After guest memory replacement and render drain; compiled variants stay alive.
