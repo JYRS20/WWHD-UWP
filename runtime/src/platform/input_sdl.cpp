@@ -931,7 +931,12 @@ static void apply_scenario(PadState& s) {
         if (t >= p.from && t < p.to) s.buttons |= p.bits;
 }
 
+#ifdef WWHD_UWP
+// Start with TV controls; the overlay still restores an explicitly saved choice.
+static std::atomic<bool> g_pro{true};
+#else
 static std::atomic<bool> g_pro{getenv("WWHD_PRO_CONTROLLER") != nullptr};
+#endif
 bool pro_controller() { return g_pro.load(std::memory_order_relaxed); }
 static std::atomic<void (*)(bool)> g_controller_listener{nullptr};
 void set_controller_listener(void (*fn)(bool pro)) { g_controller_listener = fn; }
